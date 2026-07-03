@@ -1,0 +1,12 @@
+node_modules/
+*.log
+.sessions/
+.raven/
+_slice2_test.ts
+
+# Local-only planning/research docs (kept on disk, never pushed)
+DECISIONS.md
+PROGRESS.md
+research/
+docs/ARCHITECTURE.md
+harness-builder-prompt.md

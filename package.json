@@ -1,0 +1,14 @@
+{
+  "name": "raven",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Zero-dependency, local-first, Claude Code-style agent harness",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types src/main.ts",
+    "raven": "node --experimental-strip-types src/main.ts"
+  }
+}
