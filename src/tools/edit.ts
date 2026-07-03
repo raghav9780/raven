@@ -10,6 +10,7 @@
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { isAbsolute, resolve } from 'node:path';
+import { checkSyntax } from './lint.ts';
 import type { JsonObject, Tool, ToolContext, ToolResult } from '../contracts.ts';
 
 /** Count non-overlapping occurrences of `needle` in `haystack`. */
@@ -102,6 +103,19 @@ export const editTool: Tool = {
     const updated = replaceAll
       ? original.split(oldString).join(newString)
       : original.replace(oldString, () => newString);
+
+    // Lint-gate: reject an edit that would introduce a syntax error, leaving the
+    // file unchanged, so the model sees the problem and can correct it.
+    const syntaxError = checkSyntax(absolute, updated);
+    if (syntaxError) {
+      return {
+        ok: false,
+        content:
+          `Edit rejected — it would introduce a syntax error, so ${rawPath} was ` +
+          `NOT changed:\n${syntaxError}\n\nAdjust the edit and try again.`,
+      };
+    }
+
     try {
       await writeFile(absolute, updated, 'utf8');
     } catch (err) {

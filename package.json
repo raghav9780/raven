@@ -7,6 +7,9 @@
   "engines": {
     "node": ">=22.18"
   },
+  "bin": {
+    "raven": "bin/raven.mjs"
+  },
   "scripts": {
     "start": "node --experimental-strip-types src/main.ts",
     "raven": "node --experimental-strip-types src/main.ts"

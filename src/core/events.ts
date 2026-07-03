@@ -134,6 +134,23 @@ export function recordLifecycle(
   return pushEvent(session, event);
 }
 
+/** Record that context compaction rewrote the projected history. */
+export function recordCompaction(
+  session: Session,
+  strategy: import('../contracts.ts').CompactionStrategy,
+  tokensBefore: number,
+  tokensAfter: number,
+): import('../contracts.ts').CompactionEvent {
+  const event: import('../contracts.ts').CompactionEvent = {
+    ...stamp(session, 'compaction'),
+    type: 'compaction',
+    strategy,
+    tokensBefore,
+    tokensAfter,
+  };
+  return pushEvent(session, event);
+}
+
 /** Record an error observation (transport/recovery) in the event log. */
 export function recordError(
   session: Session,

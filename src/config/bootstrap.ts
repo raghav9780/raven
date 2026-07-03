@@ -120,9 +120,18 @@ export async function resolveConfig(
     );
   }
 
-  const discovered = provider.listModels
-    ? await provider.listModels()
-    : [];
+  let discovered;
+  try {
+    discovered = provider.listModels ? await provider.listModels() : [];
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new StartupError(
+      `Could not reach the "${providerId}" backend: ${detail}. ` +
+        (providerId === 'ollama'
+          ? 'Is Ollama running? Start it with `ollama serve` (or launch the Ollama app).'
+          : 'Check the provider baseUrl and that the service is up.'),
+    );
+  }
   if (discovered.length === 0) {
     throw new NoModelsError(
       `No models found for provider "${providerId}". ` +

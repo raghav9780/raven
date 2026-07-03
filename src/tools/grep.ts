@@ -42,6 +42,12 @@ export const grepTool: Tool = {
         description: 'Only search files whose path matches this glob (e.g. "**/*.ts").',
       },
       ignore_case: { type: 'boolean', description: 'Case-insensitive match.' },
+      files_with_matches: {
+        type: 'boolean',
+        description:
+          'List only matching file paths with a match count (not every line) — ' +
+          'use this for broad searches to avoid a flood of results.',
+      },
     },
     required: ['pattern'],
     additionalProperties: false,
@@ -73,6 +79,7 @@ export const grepTool: Tool = {
         ? globToRegExp(args.glob)
         : undefined;
 
+    const filesMode = args.files_with_matches === true;
     const hits: string[] = [];
     let filesSearched = 0;
     let truncated = false;
@@ -102,8 +109,11 @@ export const grepTool: Tool = {
       const relPath = relative(ctx.cwd, file).split('\\').join('/');
       // Split on CRLF or LF so `$`-anchored patterns match and no `\r` leaks.
       const lines = text.split(/\r?\n/);
+      let fileCount = 0;
       for (let i = 0; i < lines.length; i += 1) {
         if (re.test(lines[i])) {
+          fileCount += 1;
+          if (filesMode) continue;
           const shown =
             lines[i].length > MAX_LINE_CHARS
               ? `${lines[i].slice(0, MAX_LINE_CHARS)}…`
@@ -113,6 +123,13 @@ export const grepTool: Tool = {
             truncated = true;
             break outer;
           }
+        }
+      }
+      if (filesMode && fileCount > 0) {
+        hits.push(`${relPath}: ${fileCount} match${fileCount === 1 ? '' : 'es'}`);
+        if (hits.length >= MAX_MATCHES) {
+          truncated = true;
+          break outer;
         }
       }
     }

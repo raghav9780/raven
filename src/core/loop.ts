@@ -11,12 +11,22 @@
 
 import { buildRequest, reduceStream } from './messages.ts';
 import { parseTextToolCalls } from './parser.ts';
+import { compactMessages } from './compact.ts';
+import {
+  backoffDelay,
+  isRetryable,
+  looksLikeNarration,
+  sleepWithAbort,
+  toolFingerprint,
+} from './recovery.ts';
 import {
   recordAssistantMessage,
+  recordCompaction,
   recordError,
   recordToolCall,
   recordToolResult,
   recordUsage,
+  recordUserMessage,
   textOf,
 } from './events.ts';
 import type {
@@ -44,8 +54,13 @@ export interface LoopDeps {
   checkPermission: PermissionChecker;
   logger: Logger;
   paths: HarnessPaths;
-  /** Streaming sink for the UI (text/tool deltas); optional. */
+  /** Low-level streaming sink (raw deltas); optional. NOTE: assistant PROSE is
+   *  delivered via `onAssistantText` AFTER tool-call recovery, not here — so the
+   *  UI never shows a tool call the model emitted as text. */
   onDelta?: (delta: StreamDelta) => void;
+  /** Reconciled assistant prose for a turn, emitted once AFTER recovery has
+   *  stripped any text-encoded tool call. Empty on pure tool-call turns. */
+  onAssistantText?: (text: string) => void;
   /** Called after new events are appended so a writer can flush the transcript
    *  tail (crash-safe incremental persistence); optional. */
   persist?: (session: Session) => void;
@@ -121,6 +136,12 @@ export async function runAgentLoop(
   let turns = 0;
   let stopReason: LoopStopReason = 'no_tool_use';
   let finalText = '';
+  // Stuck-loop + narration-nudge guards (bounded, reset on progress).
+  const MAX_REPEATS = 2;
+  const MAX_NUDGES = 1;
+  let lastFingerprint = '';
+  let repeatCount = 0;
+  let nudges = 0;
 
   while (turns < opts.maxTurns) {
     if (opts.signal?.aborted) {
@@ -133,7 +154,26 @@ export async function runAgentLoop(
     }
     turns += 1;
 
-    const messages = buildRequest(session.events);
+    // Compact the projected messages if they'd overflow the model window
+    // (model-free; the event log stays append-only, a compaction event is added).
+    let messages = buildRequest(session.events);
+    const compaction = compactMessages(messages, opts.contextWindow ?? 8192);
+    if (compaction.compacted) {
+      messages = compaction.messages;
+      recordCompaction(
+        session,
+        compaction.strategy === 'placeholder-clear' ? 'placeholder-clear' : 'snip',
+        compaction.before,
+        compaction.after,
+      );
+      deps.persist?.(session);
+      deps.logger.info('compacted context', {
+        strategy: compaction.strategy,
+        before: compaction.before,
+        after: compaction.after,
+      });
+    }
+
     const chatOptions: ChatOptions = {
       model: opts.model,
       maxTokens: opts.maxTokens,
@@ -144,24 +184,45 @@ export async function runAgentLoop(
       signal: opts.signal,
     };
 
-    const stream = deps.provider.chat(
-      messages,
-      deps.registry.specs(),
-      chatOptions,
-    );
-
-    // Reducing the stream may throw on an unrecoverable/streamed provider error
-    // (or an aborted fetch). Contain it: the loop returns a clean stop reason
-    // rather than unwinding the stack. Bounded backoff/fallback lands in slice 6.
-    let turn: Awaited<ReturnType<typeof reduceStream>>;
-    try {
-      turn = await reduceStream(stream, deps.onDelta);
-    } catch (err) {
-      if (opts.signal?.aborted) {
-        stopReason = 'aborted';
+    // Call the model with bounded retry on transient errors (network / 5xx /
+    // overloaded). A non-retryable error or exhausted attempts ends cleanly.
+    let turn: Awaited<ReturnType<typeof reduceStream>> | null = null;
+    let lastError: unknown = null;
+    const maxAttempts = Math.max(1, opts.retry?.maxAttempts ?? 1);
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (opts.signal?.aborted) break;
+      try {
+        turn = await reduceStream(
+          deps.provider.chat(messages, deps.registry.specs(), chatOptions),
+          deps.onDelta,
+        );
+        lastError = null;
         break;
+      } catch (err) {
+        lastError = err;
+        if (opts.signal?.aborted || !isRetryable(err) || attempt >= maxAttempts) {
+          break;
+        }
+        const delayMs = backoffDelay(
+          attempt,
+          opts.retry,
+          (err as { retryAfterSeconds?: number }).retryAfterSeconds,
+        );
+        recordError(
+          session,
+          'transient',
+          `retrying (${attempt}/${maxAttempts}) in ${delayMs}ms: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        deps.logger.warn('model call failed, retrying', { attempt, delayMs });
+        await sleepWithAbort(delayMs, opts.signal);
       }
-      const message = err instanceof Error ? err.message : String(err);
+    }
+    if (opts.signal?.aborted) {
+      stopReason = 'aborted';
+      break;
+    }
+    if (!turn) {
+      const message = lastError instanceof Error ? lastError.message : String(lastError);
       recordError(session, 'provider_error', message);
       deps.logger.error('model turn failed', { error: message });
       stopReason = 'error';
@@ -211,17 +272,58 @@ export async function runAgentLoop(
     recordUsage(session, turn.usage, opts.model);
     deps.persist?.(session);
     finalText = textOf(turn.content);
+    // Emit the reconciled prose ONCE, now that recovery has removed any
+    // text-encoded tool call — the UI streams nothing raw before this point.
+    if (finalText.trim().length > 0) deps.onAssistantText?.(finalText);
 
     if (turn.toolUses.length === 0) {
+      // Narration nudge: a weak model sometimes DESCRIBES an action instead of
+      // emitting the tool call. Once per stall, remind it to act, then continue.
+      if (nudges < MAX_NUDGES && looksLikeNarration(finalText)) {
+        nudges += 1;
+        recordUserMessage(session, [
+          {
+            type: 'text',
+            text:
+              'You described an action but did not perform it. If a tool is ' +
+              'needed, emit the tool call now — do NOT describe it or put it in ' +
+              'a code fence. If the task is already done, say so plainly.',
+          },
+        ]);
+        deps.persist?.(session);
+        continue;
+      }
       stopReason = 'no_tool_use';
       break;
     }
+    nudges = 0; // a tool call is progress
 
-    // Slice 1 executes tools serially (bash mutates; read is safe but kept
-    // simple). Parallel read-only execution via `concurrencySafe` lands later.
-    // On abort, synthesize an error result for every not-yet-executed tool_use
-    // so the event log never holds an orphaned tool_use (which would produce an
-    // invalid conversation on resume/replay).
+    // Stuck-loop guard: the same tool call(s) repeated with no progress. Record
+    // synthetic results (no orphaned tool_use) and stop instead of looping.
+    const fingerprint = toolFingerprint(turn.toolUses);
+    if (fingerprint === lastFingerprint) {
+      repeatCount += 1;
+    } else {
+      repeatCount = 0;
+      lastFingerprint = fingerprint;
+    }
+    if (repeatCount >= MAX_REPEATS) {
+      for (const toolUse of turn.toolUses) {
+        recordToolResult(session, toolUse.id, {
+          ok: false,
+          content:
+            'Stopped: the same tool call was repeated with no progress. Try a different approach.',
+        });
+      }
+      deps.persist?.(session);
+      recordError(session, 'loop', 'repeated the same tool call with no progress');
+      stopReason = 'loop';
+      break;
+    }
+
+    // Tools execute serially (bash/writes must not interleave). On abort,
+    // synthesize an error result for every not-yet-executed tool_use so the
+    // event log never holds an orphaned tool_use (invalid on resume/replay).
     let aborted = false;
     for (let i = 0; i < turn.toolUses.length; i += 1) {
       if (opts.signal?.aborted) {

@@ -630,6 +630,8 @@ export type PermissionPrompter = (
   effect: 'allow' | 'deny';
   /** Persist this decision as a new rule for the rest of the session/project. */
   remember?: 'session' | 'project' | 'never';
+  /** On deny, an optional reason the user typed, fed back to the model. */
+  reason?: string;
 }>;
 
 // ============================================================================
@@ -1210,6 +1212,10 @@ export const LoopStopReason = {
   Aborted: 'aborted',
   /** A stop condition callback requested termination. */
   StopCondition: 'stop_condition',
+  /** Detected a stuck loop (same tool call repeated with no progress). */
+  Loop: 'loop',
+  /** Compaction could not free enough context (circuit-broken). */
+  ContextExhausted: 'context_exhausted',
   /** Unrecoverable error after retries. */
   Error: 'error',
 } as const;

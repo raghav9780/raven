@@ -106,21 +106,48 @@ function coerceCall(
   return { name: nameRaw, input };
 }
 
-/** Explicit tool-call marker regions (`<tool_call>…</tool_call>` and fenced code
- *  blocks), with the FULL span so leftover-stripping removes the whole marker. */
+/** Fence languages that denote a shell command the model wants RUN (→ bash). */
+const SHELL_LANGS = new Set([
+  'sh', 'bash', 'shell', 'zsh', 'console', 'shell-session',
+  'powershell', 'pwsh', 'ps', 'ps1', 'cmd', 'bat',
+]);
+
+/** A marker region: 'call' = expects a JSON tool call inside; 'shell' = a shell
+ *  command fence whose body should become a bash call. */
+type MarkerKind = 'call' | 'shell';
+
+/**
+ * Explicit tool-call marker regions: `<tool_call>…</tool_call>` tags and fenced
+ * code blocks, each with its FULL span (so leftover-stripping removes the whole
+ * marker) and a kind derived from the fence language. Non-shell/non-call fences
+ * (e.g. ```python examples) are ignored so prose isn't misread as a call.
+ */
 function markerRegions(
   text: string,
-): Array<{ inner: string; start: number; end: number }> {
-  const regions: Array<{ inner: string; start: number; end: number }> = [];
-  const patterns = [
-    /<tool_call>([\s\S]*?)<\/tool_call>/g,
-    /```(?:json|tool_call|tool)?\s*([\s\S]*?)```/g,
-  ];
-  for (const re of patterns) {
-    let m: RegExpExecArray | null = re.exec(text);
-    while (m !== null) {
-      regions.push({ inner: m[1], start: m.index, end: m.index + m[0].length });
-      m = re.exec(text);
+): Array<{ inner: string; start: number; end: number; kind: MarkerKind }> {
+  const regions: Array<{
+    inner: string;
+    start: number;
+    end: number;
+    kind: MarkerKind;
+  }> = [];
+
+  const tagRe = /<tool_call>([\s\S]*?)<\/tool_call>/g;
+  for (let m = tagRe.exec(text); m !== null; m = tagRe.exec(text)) {
+    regions.push({ inner: m[1], start: m.index, end: m.index + m[0].length, kind: 'call' });
+  }
+
+  const fenceRe = /```([a-zA-Z0-9_+-]*)[ \t]*\r?\n?([\s\S]*?)```/g;
+  for (let m = fenceRe.exec(text); m !== null; m = fenceRe.exec(text)) {
+    const lang = m[1].toLowerCase();
+    let kind: MarkerKind | null = null;
+    if (lang === '' || lang === 'json' || lang === 'tool_call' || lang === 'tool') {
+      kind = 'call';
+    } else if (SHELL_LANGS.has(lang)) {
+      kind = 'shell';
+    }
+    if (kind) {
+      regions.push({ inner: m[2], start: m.index, end: m.index + m[0].length, kind });
     }
   }
   return regions;
@@ -145,7 +172,7 @@ function buildResult(
   leftover += text.slice(cursor);
   leftover = leftover
     .replace(/<\/?tool_call>/g, '')
-    .replace(/```(?:json|tool_call|tool)?/g, '')
+    .replace(/```[a-zA-Z0-9_+-]*/g, '')
     .trim();
   return { calls, leftoverText: leftover };
 }
@@ -167,14 +194,24 @@ export function parseTextToolCalls(
   const explicitCalls: ParsedTextCall[] = [];
   const explicitConsumed: Array<[number, number]> = [];
   for (const region of markerRegions(text)) {
+    let recovered: ParsedTextCall | undefined;
     for (const cand of findJsonObjects(region.inner)) {
       const parsed = looseParse(cand.raw);
       const call = parsed === null ? undefined : coerceCall(parsed, known);
       if (call) {
-        explicitCalls.push(call);
-        explicitConsumed.push([region.start, region.end]);
+        recovered = call;
         break;
       }
+    }
+    // A shell fence with no JSON call inside is a command the model wants run:
+    // synthesize a bash call so it executes instead of printing as dead text.
+    if (!recovered && region.kind === 'shell' && known.has('bash')) {
+      const command = region.inner.trim();
+      if (command.length > 0) recovered = { name: 'bash', input: { command } };
+    }
+    if (recovered) {
+      explicitCalls.push(recovered);
+      explicitConsumed.push([region.start, region.end]);
     }
   }
   if (explicitCalls.length > 0) {

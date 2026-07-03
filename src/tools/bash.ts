@@ -63,13 +63,11 @@ function capOutput(text: string): { text: string; truncated: boolean } {
 export const bashTool: Tool = {
   name: 'bash',
   description:
-    `Run a shell command via ${SHELL_NAME} in the working directory and return ` +
-    'its combined stdout/stderr and exit code. Use for building, testing, git, ' +
-    `file ops, and anything not covered by a dedicated tool. Use ${SHELL_NAME} ` +
-    'syntax and OS-native paths' +
-    (isWindows
-      ? ' (e.g. `Get-Content file`, `Set-Content`, backslash paths like D:\\dir).'
-      : ' (POSIX).'),
+    `Run a shell command via ${SHELL_NAME} for building, testing, git, installing, ` +
+    'or running scripts, and return its combined stdout/stderr and exit code. ' +
+    'For file work use the dedicated tools instead (read/write/edit/glob/grep) — ' +
+    `do NOT use bash to read, write, list, or search files. Use ${SHELL_NAME} syntax` +
+    (isWindows ? ' and Windows paths (backslashes, e.g. D:\\dir).' : ' (POSIX).'),
   inputSchema: {
     type: 'object',
     properties: {

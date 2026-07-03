@@ -39,7 +39,12 @@ export const writeTool: Tool = {
     const absolute = isAbsolute(rawPath) ? rawPath : resolve(ctx.cwd, rawPath);
     const existed = existsSync(absolute);
     try {
-      await mkdir(dirname(absolute), { recursive: true });
+      // Only create the parent when it's missing — calling mkdir on an existing
+      // directory (notably a Windows drive root like `D:\`) throws EPERM.
+      const parent = dirname(absolute);
+      if (!existsSync(parent)) {
+        await mkdir(parent, { recursive: true });
+      }
       await writeFile(absolute, content, 'utf8');
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
