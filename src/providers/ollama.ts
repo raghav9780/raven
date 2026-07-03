@@ -285,14 +285,30 @@ export function createOllamaProvider(cfg: ProviderConfig): ModelProvider {
     if (options.stopSequences && options.stopSequences.length > 0) {
       ollamaOptions.stop = options.stopSequences;
     }
+    // When tools are offered, bias toward deterministic tool-calling (a low
+    // temperature reduces the model narrating instead of emitting a call).
+    if (tools.length > 0 && options.temperature === undefined) {
+      ollamaOptions.temperature = 0.1;
+    }
 
     const body: JsonObject = {
       model: options.model,
       messages: toOllamaMessages(messages, options.system) as unknown as JsonObject[],
       stream: true,
+      // Keep the model resident between turns — avoids a multi-second reload on
+      // every request, which dominates latency for local models.
+      keep_alive: '30m',
       options: ollamaOptions,
     };
-    if (tools.length > 0) body.tools = toOllamaTools(tools);
+    if (tools.length > 0) {
+      body.tools = toOllamaTools(tools);
+      // Encourage a tool call this turn when the loop requested auto/any.
+      if (options.toolChoice && options.toolChoice.type !== 'none') {
+        body.tool_choice = options.toolChoice.type === 'tool'
+          ? { type: 'function', function: { name: options.toolChoice.name } }
+          : options.toolChoice.type;
+      }
+    }
     if (options.extraBody) Object.assign(body, options.extraBody);
 
     let res: Response;

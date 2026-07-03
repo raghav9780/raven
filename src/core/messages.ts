@@ -33,6 +33,27 @@ export interface ReducedTurn {
 
 const EMPTY_USAGE: Usage = { inputTokens: 0, outputTokens: 0 };
 
+/** Error thrown when the provider stream surfaces an ErrorDelta. Carries the
+ *  transport metadata so the loop's recovery layer can decide whether to retry. */
+export class ProviderStreamError extends Error {
+  readonly code: string;
+  readonly retryable: boolean;
+  readonly httpStatus?: number;
+  readonly retryAfterSeconds?: number;
+  constructor(delta: Extract<StreamDelta, { type: 'error' }>) {
+    super(
+      `provider error [${delta.code}]${
+        delta.httpStatus ? ` (HTTP ${delta.httpStatus})` : ''
+      }: ${delta.message}`,
+    );
+    this.name = 'ProviderStreamError';
+    this.code = delta.code;
+    this.retryable = delta.retryable ?? false;
+    this.httpStatus = delta.httpStatus;
+    this.retryAfterSeconds = delta.retryAfterSeconds;
+  }
+}
+
 /** Best-effort parse of an accumulated partial-JSON tool-arg fragment, with
  *  small-model JSON repair (trailing commas, single quotes, truncation, …). */
 function parseFragment(frag: string): Record<string, unknown> {
@@ -115,14 +136,9 @@ export async function reduceStream(
         if (delta.usage) usage = delta.usage;
         break;
       case 'error':
-        // Surface as a thrown value only if unrecoverable; slice-1 providers
-        // map transport issues to this. The loop treats a thrown error as a
-        // failed turn. Recoverable handling lands in slice 6 (core/recovery.ts).
-        throw new Error(
-          `provider error [${delta.code}]${
-            delta.httpStatus ? ` (HTTP ${delta.httpStatus})` : ''
-          }: ${delta.message}`,
-        );
+        // Surface as a typed throw; the loop's recovery layer decides whether to
+        // retry based on `retryable`/`httpStatus`.
+        throw new ProviderStreamError(delta);
       default:
         break;
     }
