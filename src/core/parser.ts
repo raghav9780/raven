@@ -1,15 +1,17 @@
 /**
- * parser.ts — text-protocol tool-call repair (ADR-0011). Many local models,
- * even ones that advertise native tools, sometimes emit a tool call as TEXT
+ * parser.ts — text-protocol tool-call repair (ADR-0011). Many local models, even
+ * ones that advertise native tools, sometimes emit a tool call as TEXT
  * (`{"name":"read","arguments":{...}}`, a fenced ```json block, or Hermes/Qwen
  * `<tool_call>…</tool_call>` tags) instead of the native `tool_calls` field.
  *
  * When a turn produced NO native tool call, the loop runs this over the assistant
- * text: if it finds a JSON object naming a KNOWN tool with an arguments object,
- * it converts it into a real tool call. This is a FALLBACK — native is primary,
- * and matching is gated on a known tool name to keep false positives low
- * (a model merely printing example JSON should not trigger execution unless the
- * name matches a real tool).
+ * text and converts a recovered call into a real tool call. Native is primary;
+ * this is a gated fallback. To avoid EXECUTING example/config JSON that merely
+ * mentions a tool (tool names are common words), a bare (unmarked) call is
+ * accepted only when it DOMINATES the message (≥ CALL_DOMINANCE of the text);
+ * calls inside an explicit `<tool_call>`/fenced marker are always honored. A
+ * candidate must also be call-shaped (known name + an arguments/parameters/input
+ * key). (Dominance guard adapted from the ollama-local-coding-agent recovery.)
  */
 
 import { looseParse } from './jsonRepair.ts';
@@ -26,6 +28,9 @@ export interface RepairResult {
   calls: ParsedTextCall[];
   leftoverText: string;
 }
+
+/** Fraction of the (trimmed) message a bare call must occupy to be honored. */
+const CALL_DOMINANCE = 0.5;
 
 /** Scan for top-level `{…}` objects, honoring strings/escapes/nesting. */
 function findJsonObjects(
@@ -62,7 +67,11 @@ function findJsonObjects(
   return out;
 }
 
-/** Coerce a parsed object into a tool call if it names a known tool. */
+/**
+ * Coerce a parsed object into a tool call if it names a KNOWN tool AND is
+ * call-shaped (carries an arguments/parameters/input key). The args-key
+ * requirement rejects bare `{"name":"read"}`-style mentions that are not calls.
+ */
 function coerceCall(
   value: unknown,
   known: Set<string>,
@@ -77,14 +86,18 @@ function coerceCall(
   const nameRaw = obj.name ?? obj.tool ?? obj.tool_name ?? fn?.name;
   if (typeof nameRaw !== 'string' || !known.has(nameRaw)) return undefined;
 
+  const hasArgsKey =
+    'arguments' in obj ||
+    'parameters' in obj ||
+    'input' in obj ||
+    (fn !== undefined && 'arguments' in fn);
+  if (!hasArgsKey) return undefined;
+
   let argsRaw =
     obj.arguments ?? obj.parameters ?? obj.input ?? fn?.arguments ?? {};
   if (typeof argsRaw === 'string') {
-    try {
-      argsRaw = JSON.parse(argsRaw);
-    } catch {
-      argsRaw = {};
-    }
+    const parsed = looseParse(argsRaw);
+    argsRaw = parsed === null ? {} : parsed;
   }
   const input =
     typeof argsRaw === 'object' && argsRaw !== null
@@ -93,58 +106,110 @@ function coerceCall(
   return { name: nameRaw, input };
 }
 
+/** Explicit tool-call marker regions (`<tool_call>…</tool_call>` and fenced code
+ *  blocks), with the FULL span so leftover-stripping removes the whole marker. */
+function markerRegions(
+  text: string,
+): Array<{ inner: string; start: number; end: number }> {
+  const regions: Array<{ inner: string; start: number; end: number }> = [];
+  const patterns = [
+    /<tool_call>([\s\S]*?)<\/tool_call>/g,
+    /```(?:json|tool_call|tool)?\s*([\s\S]*?)```/g,
+  ];
+  for (const re of patterns) {
+    let m: RegExpExecArray | null = re.exec(text);
+    while (m !== null) {
+      regions.push({ inner: m[1], start: m.index, end: m.index + m[0].length });
+      m = re.exec(text);
+    }
+  }
+  return regions;
+}
+
+/** Build the result: leftover = text minus consumed spans, tags/fences stripped. */
+function buildResult(
+  text: string,
+  calls: ParsedTextCall[],
+  consumed: Array<[number, number]>,
+): RepairResult {
+  if (calls.length === 0) return { calls: [], leftoverText: text };
+  const ordered = [...consumed].sort((a, b) => a[0] - b[0]);
+  let leftover = '';
+  let cursor = 0;
+  for (const [start, end] of ordered) {
+    if (start >= cursor) {
+      leftover += text.slice(cursor, start);
+      cursor = end;
+    }
+  }
+  leftover += text.slice(cursor);
+  leftover = leftover
+    .replace(/<\/?tool_call>/g, '')
+    .replace(/```(?:json|tool_call|tool)?/g, '')
+    .trim();
+  return { calls, leftoverText: leftover };
+}
+
 /**
- * Attempt to recover tool calls from assistant text. Returns any recovered calls
- * (in order) plus the leftover prose (matched call blocks and `<tool_call>` tags
- * stripped). If nothing matches, `calls` is empty and `leftoverText` is the input.
+ * Recover tool calls from assistant text. Returns any recovered calls (in order)
+ * plus leftover prose. Returns no calls when the text is ordinary prose that only
+ * mentions/exemplifies a tool.
  */
 export function parseTextToolCalls(
   text: string,
   knownToolNames: string[],
 ): RepairResult {
   const known = new Set(knownToolNames);
-  const calls: ParsedTextCall[] = [];
-  const consumed: Array<[number, number]> = [];
+  const trimmedTotal = text.trim().length;
+  if (trimmedTotal === 0) return { calls: [], leftoverText: text };
 
-  for (const candidate of findJsonObjects(text)) {
-    const parsed = looseParse(candidate.raw);
-    if (parsed === null) continue;
-    const call = coerceCall(parsed, known);
-    if (call) {
-      calls.push(call);
-      consumed.push([candidate.start, candidate.end]);
-    }
-  }
-
-  // Truncation fallback: the balanced scanner can't capture an object that was
-  // cut off mid-stream (no closing brace). Try repairing from the first `{`.
-  if (calls.length === 0) {
-    const firstBrace = text.indexOf('{');
-    if (firstBrace !== -1) {
-      const parsed = looseParse(text.slice(firstBrace));
+  // 1) Explicit markers — always honored (the model signalled intent).
+  const explicitCalls: ParsedTextCall[] = [];
+  const explicitConsumed: Array<[number, number]> = [];
+  for (const region of markerRegions(text)) {
+    for (const cand of findJsonObjects(region.inner)) {
+      const parsed = looseParse(cand.raw);
       const call = parsed === null ? undefined : coerceCall(parsed, known);
       if (call) {
-        calls.push(call);
-        consumed.push([firstBrace, text.length]);
+        explicitCalls.push(call);
+        explicitConsumed.push([region.start, region.end]);
+        break;
+      }
+    }
+  }
+  if (explicitCalls.length > 0) {
+    return buildResult(text, explicitCalls, explicitConsumed);
+  }
+
+  // 2) Bare objects — honored only if they DOMINATE the message.
+  const bareCalls: ParsedTextCall[] = [];
+  const bareConsumed: Array<[number, number]> = [];
+  let consumedLen = 0;
+  for (const cand of findJsonObjects(text)) {
+    const parsed = looseParse(cand.raw);
+    const call = parsed === null ? undefined : coerceCall(parsed, known);
+    if (call) {
+      bareCalls.push(call);
+      bareConsumed.push([cand.start, cand.end]);
+      consumedLen += cand.raw.trim().length;
+    }
+  }
+  if (bareCalls.length > 0 && consumedLen / trimmedTotal >= CALL_DOMINANCE) {
+    return buildResult(text, bareCalls, bareConsumed);
+  }
+
+  // 3) Truncation fallback — a streamed/cut-off object that IS the message.
+  if (bareCalls.length === 0) {
+    const firstBrace = text.indexOf('{');
+    if (firstBrace !== -1) {
+      const tail = text.slice(firstBrace);
+      if (tail.trim().length / trimmedTotal >= CALL_DOMINANCE) {
+        const parsed = looseParse(tail);
+        const call = parsed === null ? undefined : coerceCall(parsed, known);
+        if (call) return buildResult(text, [call], [[firstBrace, text.length]]);
       }
     }
   }
 
-  if (calls.length === 0) return { calls: [], leftoverText: text };
-
-  // Build leftover prose: original text minus the consumed JSON spans, then
-  // strip any dangling Hermes/Qwen tool-call tags and code fences.
-  let leftover = '';
-  let cursor = 0;
-  for (const [start, end] of consumed) {
-    leftover += text.slice(cursor, start);
-    cursor = end;
-  }
-  leftover += text.slice(cursor);
-  leftover = leftover
-    .replace(/<\/?tool_call>/g, '')
-    .replace(/```(?:json)?/g, '')
-    .trim();
-
-  return { calls, leftoverText: leftover };
+  return { calls: [], leftoverText: text };
 }

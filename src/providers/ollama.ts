@@ -13,6 +13,7 @@
  */
 
 import { createNdjsonDecoder } from './ndjson.ts';
+import { looseParse } from '../core/jsonRepair.ts';
 import type {
   CapabilityProfile,
   ChatOptions,
@@ -75,11 +76,22 @@ interface OllamaShowResponse {
 
 // ---- helpers ----------------------------------------------------------------
 
-/** Resolve the base URL: config → $OLLAMA_HOST → localhost (never hardcoded). */
+/** Resolve the base URL: config → $OLLAMA_HOST → localhost (never hardcoded).
+ *  A bare host (no scheme) with no explicit port defaults to Ollama's 11434. */
 function resolveBaseUrl(cfg: ProviderConfig): string {
   const raw = cfg.baseUrl ?? process.env.OLLAMA_HOST ?? DEFAULT_BASE_URL;
-  const withScheme = /^https?:\/\//i.test(raw) ? raw : `http://${raw}`;
-  return withScheme.replace(/\/+$/, '');
+  const hadScheme = /^https?:\/\//i.test(raw);
+  let url = hadScheme ? raw : `http://${raw}`;
+  if (!hadScheme) {
+    try {
+      const parsed = new URL(url);
+      if (!parsed.port) parsed.port = '11434';
+      url = parsed.toString();
+    } catch {
+      // keep the prefixed form if it doesn't parse as a URL
+    }
+  }
+  return url.replace(/\/+$/, '');
 }
 
 function blockText(content: string | Array<{ type: string }>): string {
@@ -165,6 +177,9 @@ function toOllamaTools(tools: ToolSpec[]): JsonObject[] {
 function mapDoneReason(reason: string | undefined, sawToolCall: boolean): StopReason {
   if (sawToolCall) return 'tool_use';
   if (reason === 'length') return 'max_tokens';
+  // NOTE: Ollama reports done_reason:"stop" for BOTH natural completion and a
+  // stop-sequence match, so StopReason.StopSequence is unreachable via this
+  // adapter — a stop hit is (correctly) surfaced as end_turn.
   return 'end_turn';
 }
 
@@ -214,37 +229,40 @@ export function createOllamaProvider(cfg: ProviderConfig): ModelProvider {
   }
 
   async function describeModel(model: string): Promise<CapabilityProfile> {
-    const res = await fetch(`${baseUrl}/api/show`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ model }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!res.ok) {
-      // Fall back to conservative defaults rather than failing discovery.
+    // Any transport/timeout/parse failure falls back to conservative defaults —
+    // a slow or restarting Ollama must not break capability discovery.
+    try {
+      const res = await fetch(`${baseUrl}/api/show`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ model }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) return conservativeProfile();
+      const body = (await res.json()) as OllamaShowResponse;
+      const tags = body.capabilities ?? [];
+      const modelInfo = body.model_info ?? {};
+      const ctxKey = Object.keys(modelInfo).find((k) =>
+        k.endsWith('.context_length'),
+      );
+      const ctxVal = ctxKey ? modelInfo[ctxKey] : undefined;
+      const contextWindow =
+        typeof ctxVal === 'number' && ctxVal > 0 ? ctxVal : 8192;
+      const nativeTools = tags.includes('tools');
+
+      return {
+        nativeTools,
+        contextWindow,
+        maxOutputTokens: Math.min(4096, contextWindow),
+        supportsStreaming: true,
+        supportsVision: tags.includes('vision'),
+        supportsThinking: tags.includes('thinking'),
+        supportsPromptCache: false,
+        toolCallFormat: nativeTools ? 'native' : 'xml',
+      };
+    } catch {
       return conservativeProfile();
     }
-    const body = (await res.json()) as OllamaShowResponse;
-    const tags = body.capabilities ?? [];
-    const modelInfo = body.model_info ?? {};
-    const ctxKey = Object.keys(modelInfo).find((k) =>
-      k.endsWith('.context_length'),
-    );
-    const ctxVal = ctxKey ? modelInfo[ctxKey] : undefined;
-    const contextWindow =
-      typeof ctxVal === 'number' && ctxVal > 0 ? ctxVal : 8192;
-    const nativeTools = tags.includes('tools');
-
-    return {
-      nativeTools,
-      contextWindow,
-      maxOutputTokens: Math.min(4096, contextWindow),
-      supportsStreaming: true,
-      supportsVision: tags.includes('vision'),
-      supportsThinking: tags.includes('thinking'),
-      supportsPromptCache: false,
-      toolCallFormat: nativeTools ? 'native' : 'xml',
-    };
   }
 
   async function* chat(
@@ -286,6 +304,8 @@ export function createOllamaProvider(cfg: ProviderConfig): ModelProvider {
         signal: options.signal,
       });
     } catch (err) {
+      // A cancelled request ends cleanly — don't mislabel it a retryable error.
+      if (options.signal?.aborted || (err as Error)?.name === 'AbortError') return;
       yield {
         type: 'error',
         code: 'network',
@@ -343,9 +363,12 @@ export function createOllamaProvider(cfg: ProviderConfig): ModelProvider {
       if (msg?.tool_calls) {
         for (const tc of msg.tool_calls) {
           const name = tc.function.name;
-          const parsed =
+          // Ollama usually delivers arguments as an object; some model builds
+          // send a JSON string. Repair-parse it (fall back to {}) rather than
+          // letting a bad payload throw and be mislabeled a network error.
+          const parsed: JsonObject =
             typeof tc.function.arguments === 'string'
-              ? (JSON.parse(tc.function.arguments || '{}') as JsonObject)
+              ? ((looseParse(tc.function.arguments) as JsonObject | null) ?? {})
               : tc.function.arguments;
           const id = tc.id ?? `${name}-${toolIndex}`;
           yield { type: 'tool-call-start', index: toolIndex, id, name };

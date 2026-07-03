@@ -1150,6 +1150,9 @@ export interface ErrorEvent extends EventBase {
 export interface LifecycleEvent extends EventBase {
   type: 'lifecycle';
   phase: 'start' | 'end' | 'resume';
+  /** Absolute working directory at session start; restored on resume so relative
+   *  tool paths bind to the original project, not wherever resume is run. */
+  cwd?: string;
 }
 
 /** The append-only event union — the harness's durable spine. */

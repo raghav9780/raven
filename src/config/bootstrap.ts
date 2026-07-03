@@ -115,7 +115,9 @@ export async function resolveConfig(
   const providerId = opts.provider ?? 'ollama';
   const provider = providers[providerId];
   if (!provider) {
-    throw new Error(`No provider registered for id "${providerId}".`);
+    throw new StartupError(
+      `Unknown provider "${providerId}". Available: ${Object.keys(providers).join(', ') || '(none)'}.`,
+    );
   }
 
   const discovered = provider.listModels

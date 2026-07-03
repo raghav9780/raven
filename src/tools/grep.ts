@@ -100,7 +100,8 @@ export const grepTool: Tool = {
       filesSearched += 1;
 
       const relPath = relative(ctx.cwd, file).split('\\').join('/');
-      const lines = text.split('\n');
+      // Split on CRLF or LF so `$`-anchored patterns match and no `\r` leaks.
+      const lines = text.split(/\r?\n/);
       for (let i = 0; i < lines.length; i += 1) {
         if (re.test(lines[i])) {
           const shown =

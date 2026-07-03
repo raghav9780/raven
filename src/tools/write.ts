@@ -46,7 +46,9 @@ export const writeTool: Tool = {
       return { ok: false, content: `Could not write ${rawPath}: ${message}` };
     }
     const bytes = Buffer.byteLength(content, 'utf8');
-    const lines = content.length === 0 ? 0 : content.split('\n').length;
+    // Count lines without letting a single trailing newline inflate the total.
+    const lines =
+      content.length === 0 ? 0 : content.replace(/\n$/, '').split('\n').length;
     return {
       ok: true,
       content: `${existed ? 'Overwrote' : 'Created'} ${rawPath} (${lines} lines, ${bytes} bytes).`,

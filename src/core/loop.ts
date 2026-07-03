@@ -180,7 +180,11 @@ export async function runAgentLoop(
           deps.registry.list().map((tool) => tool.name),
         );
         if (repaired.calls.length > 0) {
-          const rebuilt: ContentBlock[] = [];
+          // Preserve any thinking block; replace the raw text with the leftover
+          // prose, then append the recovered tool_use blocks.
+          const rebuilt: ContentBlock[] = turn.content.filter(
+            (block) => block.type === 'thinking',
+          );
           if (repaired.leftoverText.length > 0) {
             rebuilt.push({ type: 'text', text: repaired.leftoverText });
           }

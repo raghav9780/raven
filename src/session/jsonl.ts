@@ -65,13 +65,19 @@ export interface TranscriptWriter {
   written(): number;
 }
 
-/** Create a transcript writer for a session, ensuring the directory exists. */
+/**
+ * Create a transcript writer for a session, ensuring the directory exists.
+ * `alreadyWritten` is the number of events already on disk — pass
+ * `session.events.length` when RESUMING so the writer only appends the new tail
+ * (otherwise it would re-append the entire prior history, corrupting the log).
+ */
 export function createTranscriptWriter(
   transcriptPath: string,
   sessionId: string,
+  alreadyWritten = 0,
 ): TranscriptWriter {
   mkdirSync(dirname(transcriptPath), { recursive: true });
-  let writtenCount = 0;
+  let writtenCount = alreadyWritten;
   return {
     persist(session: Session): void {
       if (session.events.length <= writtenCount) return;
@@ -113,17 +119,23 @@ export function replay(
   };
 }
 
-/** Load and rebuild a Session from a transcript file. */
+/** Load and rebuild a Session from a transcript file. Tolerates a corrupt/partial
+ *  LAST line (a crash mid-append), but treats a corrupt line anywhere earlier as
+ *  a hard error — silently dropping a mid-file event would orphan a tool_use and
+ *  yield an invalid conversation on replay. */
 export function loadSession(transcriptPath: string, cwd: string): Session {
   const raw = readFileSync(transcriptPath, 'utf8');
+  const lines = raw.split('\n').filter((line) => line.trim().length > 0);
   const entries: TranscriptEntry[] = [];
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed.length === 0) continue;
+  for (let i = 0; i < lines.length; i += 1) {
     try {
-      entries.push(JSON.parse(trimmed) as TranscriptEntry);
-    } catch {
-      // skip a corrupt trailing/partial line (crash-safety)
+      entries.push(JSON.parse(lines[i].trim()) as TranscriptEntry);
+    } catch (err) {
+      if (i === lines.length - 1) break; // partial final line from a crash — ok
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Corrupt transcript ${transcriptPath} at line ${i + 1}: ${message}`,
+      );
     }
   }
   return replay(entries, transcriptPath, cwd);

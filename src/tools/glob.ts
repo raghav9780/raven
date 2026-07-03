@@ -31,10 +31,15 @@ export function globToRegExp(pattern: string): RegExp {
     const c = pattern[i];
     if (c === '*') {
       if (pattern[i + 1] === '*') {
-        // `**` → any number of path segments; consume an optional trailing slash
-        re += '.*';
-        i += 1;
-        if (pattern[i + 1] === '/') i += 1;
+        i += 1; // consume the second '*'
+        if (pattern[i + 1] === '/') {
+          // `**/` → zero or more path segments (keeps the segment boundary, so
+          // `a/**/b` matches `a/b` and `a/x/b` but NOT `a/xb`)
+          re += '(?:.*/)?';
+          i += 1; // consume the '/'
+        } else {
+          re += '.*'; // trailing `**` → anything
+        }
       } else {
         re += '[^/]*';
       }

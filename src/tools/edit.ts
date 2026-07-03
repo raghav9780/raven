@@ -96,9 +96,12 @@ export const editTool: Tool = {
       };
     }
 
+    // Use split/join (replace_all) or a replacer FUNCTION (single) so special
+    // replacement patterns in new_string ($$, $&, $`, $') are inserted
+    // literally rather than interpreted by String.prototype.replace.
     const updated = replaceAll
       ? original.split(oldString).join(newString)
-      : original.replace(oldString, newString);
+      : original.replace(oldString, () => newString);
     try {
       await writeFile(absolute, updated, 'utf8');
     } catch (err) {

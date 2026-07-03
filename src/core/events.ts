@@ -11,6 +11,7 @@ import type {
   ContentBlock,
   ErrorEvent,
   JsonObject,
+  LifecycleEvent,
   Message,
   Session,
   StopReason,
@@ -114,6 +115,21 @@ export function recordUsage(
     type: 'usage',
     usage,
     model,
+  };
+  return pushEvent(session, event);
+}
+
+/** Record a session lifecycle marker (start/end/resume); `cwd` is stored on start. */
+export function recordLifecycle(
+  session: Session,
+  phase: 'start' | 'end' | 'resume',
+  cwd?: string,
+): LifecycleEvent {
+  const event: LifecycleEvent = {
+    ...stamp(session, 'lifecycle'),
+    type: 'lifecycle',
+    phase,
+    ...(cwd ? { cwd } : {}),
   };
   return pushEvent(session, event);
 }

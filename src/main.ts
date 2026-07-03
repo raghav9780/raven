@@ -29,7 +29,7 @@ import {
   transcriptPathFor,
 } from './session/jsonl.ts';
 import { runAgentLoop } from './core/loop.ts';
-import { recordUserMessage } from './core/events.ts';
+import { recordLifecycle, recordUserMessage } from './core/events.ts';
 import type { LoopDeps } from './core/loop.ts';
 import type { LogLevel } from './config/logger.ts';
 import type {
@@ -282,6 +282,7 @@ async function main(): Promise<void> {
   };
 
   let session: Session;
+  let alreadyWritten = 0;
   if (args.resume !== undefined) {
     const id = args.resume || listSessions(config.paths)[0];
     if (!id) {
@@ -291,11 +292,26 @@ async function main(): Promise<void> {
     const transcriptPath = transcriptPathFor(config.paths, id);
     try {
       session = loadSession(transcriptPath, config.paths.root);
-    } catch {
-      process.stderr.write(`Could not load session "${id}" (${transcriptPath}).\n`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`Could not load session "${id}": ${message}\n`);
       process.exitCode = 1;
       return;
     }
+    // Restore the original working directory so relative tool paths bind to the
+    // project the session was created in, not wherever resume is run.
+    const startEvent = session.events.find(
+      (e): e is Extract<typeof e, { type: 'lifecycle' }> =>
+        e.type === 'lifecycle' && e.phase === 'start' && typeof e.cwd === 'string',
+    );
+    if (startEvent?.cwd && startEvent.cwd !== session.cwd) {
+      process.stdout.write(
+        `\x1b[33mnote: restoring original working dir ${startEvent.cwd} ` +
+          `(resume was run from ${session.cwd})\x1b[0m\n`,
+      );
+      session.cwd = startEvent.cwd;
+    }
+    alreadyWritten = session.events.length;
     process.stdout.write(
       `\x1b[2mresumed session ${session.id} — ${session.events.length} prior events\x1b[0m\n`,
     );
@@ -311,9 +327,14 @@ async function main(): Promise<void> {
       createdAt: now,
       updatedAt: now,
     };
+    recordLifecycle(session, 'start', session.cwd);
   }
 
-  const writer = createTranscriptWriter(session.transcriptPath, session.id);
+  const writer = createTranscriptWriter(
+    session.transcriptPath,
+    session.id,
+    alreadyWritten,
+  );
   recordUserMessage(session, [{ type: 'text', text: prompt }]);
   writer.persist(session);
 
