@@ -13,7 +13,8 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createOllamaProvider } from './providers/ollama.ts';
-import { loadConfig, userConfigPath } from './config/load.ts';
+import { createOpenAIProvider } from './providers/openai.ts';
+import { loadConfig, loadDotEnv, userConfigPath } from './config/load.ts';
 import { loadProjectRules } from './config/rules.ts';
 import { resolveConfig, StartupError } from './config/bootstrap.ts';
 import { createLogger } from './config/logger.ts';
@@ -43,6 +44,7 @@ import type { ReplContext } from './ui/repl.ts';
 import type { LogLevel } from './config/logger.ts';
 import type {
   AgentLoopOptions,
+  ModelProvider,
   PermissionMode,
   PermissionPrompter,
   ProviderConfig,
@@ -246,6 +248,7 @@ function buildSystemPrompt(
     `Tools (invoke them through the tool-calling mechanism — never write a call as text):\n` +
     `${toolLines}\n\n` +
     `How to work — every turn:\n` +
+    `- Use tools only when the request needs an ACTION or information you don't have. For greetings, small talk, or questions you can answer directly, just reply in plain text — do NOT call any tool or explore files unasked.\n` +
     `- To take an action you MUST use the tool-calling mechanism. NEVER print a tool call as text, JSON, or inside a \`\`\` code fence. NEVER print a shell command in a code fence — put the command in the bash tool's "command" argument so it actually runs.\n` +
     `- Do NOT say what you are about to do ("I'll read…", "let me run…"). Do it: emit the tool call now.\n` +
     `- Do NOT ask the user to make trivial choices or supply values you can reasonably pick yourself (file names, sample text, a song's words, etc.). Assume sensible defaults, note them in a few words, and proceed with the tool call. Only ask the user when GENUINELY blocked (missing credentials, or a truly destructive/ambiguous action).\n` +
@@ -262,6 +265,52 @@ function buildSystemPrompt(
   return base + tail;
 }
 
+/** Adapter factories keyed by dialect (`ProviderConfig.type`, default = id). */
+const PROVIDER_ADAPTERS: Record<
+  string,
+  (cfg: ProviderConfig) => ModelProvider
+> = {
+  ollama: createOllamaProvider,
+  openai: createOpenAIProvider,
+};
+
+/**
+ * Instantiate every provider declared in config (plus the requested one, so
+ * zero-config `raven` still gets a default entry). A declared entry whose
+ * `type` names no known adapter throws an actionable error naming the bad type
+ * (rather than being silently dropped, which would later surface as a
+ * misleading "unknown provider").
+ */
+function buildProviders(
+  partial: ReturnType<typeof loadConfig>,
+  requested: string,
+): Record<string, ModelProvider> {
+  const entries: ProviderConfig[] = [...(partial.providers ?? [])];
+  if (!entries.some((p) => p.id === requested)) {
+    entries.push({ id: requested });
+  }
+  const map: Record<string, ModelProvider> = {};
+  for (const cfg of entries) {
+    const dialect = cfg.type ?? cfg.id;
+    const factory = PROVIDER_ADAPTERS[dialect];
+    if (!factory) {
+      // An explicit `type` that doesn't resolve is a config error, not an
+      // unknown built-in provider — say so. A bare `{id}` with no matching
+      // adapter (e.g. a future built-in not yet wired) is skipped silently and
+      // reported by resolveConfig only if it's the one actually requested.
+      if (cfg.type) {
+        throw new StartupError(
+          `Provider "${cfg.id}" declares unknown type "${cfg.type}". ` +
+            `Known types: ${Object.keys(PROVIDER_ADAPTERS).join(', ')}.`,
+        );
+      }
+      continue;
+    }
+    map[cfg.id] = factory(cfg);
+  }
+  return map;
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
@@ -269,17 +318,20 @@ async function main(): Promise<void> {
     return;
   }
 
+  loadDotEnv(args.cwd); // populate process.env from .env before secrets resolve
   const partial = loadConfig(args.cwd);
-  const providerCfg: ProviderConfig =
-    partial.providers?.find((p) => p.id === (args.provider ?? 'ollama')) ??
-    { id: args.provider ?? 'ollama' };
-  const providers = { ollama: createOllamaProvider(providerCfg) };
+  // Effective provider: --provider flag > the config entry marked `active` >
+  // ollama. This is the local↔API toggle (flip `active` in raven.config.json).
+  const activeProviderId =
+    args.provider ?? partial.providers?.find((p) => p.active)?.id ?? 'ollama';
 
   let resolved;
+  let providers;
   try {
+    providers = buildProviders(partial, activeProviderId);
     resolved = await resolveConfig(partial, providers, {
       cwd: args.cwd,
-      provider: args.provider,
+      provider: activeProviderId,
       model: args.model,
       permissionMode: args.mode,
     });
@@ -295,6 +347,9 @@ async function main(): Promise<void> {
   const { config, model, discovered } = resolved;
   let profile = resolved.profile;
   let modelId = model.modelId;
+  // The adapter every model turn goes through — the one that resolved the
+  // model, NOT a fixed default (a --provider run must chat via that provider).
+  const activeProvider = providers[model.provider];
 
   // Optional startup model picker (--pick): choose from installed models with
   // arrow keys. Bare launch keeps the auto-selected default (no prompt).
@@ -306,9 +361,9 @@ async function main(): Promise<void> {
     });
     if (picked && picked !== modelId) {
       modelId = picked;
-      profile = providers.ollama.describeModel
-        ? await providers.ollama.describeModel(picked)
-        : providers.ollama.capabilities(picked);
+      profile = activeProvider.describeModel
+        ? await activeProvider.describeModel(picked)
+        : activeProvider.capabilities(picked);
     }
   }
 
@@ -454,7 +509,7 @@ async function main(): Promise<void> {
       writer,
       gateState,
       makeChecker,
-      provider: providers.ollama,
+      provider: activeProvider,
       registry,
       logger,
       paths: config.paths,
@@ -498,7 +553,7 @@ async function main(): Promise<void> {
     signal: abort.signal,
   };
   const deps: LoopDeps = {
-    provider: providers.ollama,
+    provider: activeProvider,
     registry,
     checkPermission,
     logger,

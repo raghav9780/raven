@@ -13,6 +13,7 @@
  */
 
 import { createNdjsonDecoder } from './ndjson.ts';
+import { createIdleWatchdog, describeTransportError } from './watchdog.ts';
 import { looseParse } from '../core/jsonRepair.ts';
 import type {
   CapabilityProfile,
@@ -32,6 +33,15 @@ import type {
 
 const DEFAULT_BASE_URL = 'http://localhost:11434';
 const DISCOVERY_TIMEOUT_MS = 15_000;
+/**
+ * Abort the chat request when the connection produces NO bytes for this long.
+ * The timer resets on every received chunk, so a slow-but-alive stream is never
+ * cut off — only a dead socket is. Generous because a cold model load plus
+ * prompt eval can take over a minute before the first token. Without this, a
+ * crashed Ollama hangs each attempt until the OS TCP timeout (~5 minutes).
+ * Overridable per provider via `ProviderConfig.idleTimeoutMs`.
+ */
+const CHAT_IDLE_TIMEOUT_MS = 120_000;
 
 // ---- wire shapes (normalized away before leaving this module) ---------------
 
@@ -202,6 +212,7 @@ function conservativeProfile(): CapabilityProfile {
 export function createOllamaProvider(cfg: ProviderConfig): ModelProvider {
   const baseUrl = resolveBaseUrl(cfg);
   const timeoutMs = cfg.timeoutMs ?? DISCOVERY_TIMEOUT_MS;
+  const idleTimeoutMs = cfg.idleTimeoutMs ?? CHAT_IDLE_TIMEOUT_MS;
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     ...(cfg.headers ?? {}),
@@ -311,27 +322,50 @@ export function createOllamaProvider(cfg: ProviderConfig): ModelProvider {
     }
     if (options.extraBody) Object.assign(body, options.extraBody);
 
+    // Idle watchdog: aborts the request when NO bytes arrive for a while
+    // (reset on every chunk below). Merged with the caller's signal so Ctrl+C
+    // still cancels immediately; `idleFired` distinguishes the two on abort.
+    const watchdog = createIdleWatchdog(options.signal, idleTimeoutMs);
+    const { resetIdle } = watchdog;
+    const cleanupWatchdog = watchdog.cleanup;
+
     let res: Response;
     try {
       res = await fetch(`${baseUrl}/api/chat`, {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
-        signal: options.signal,
+        signal: watchdog.signal,
       });
     } catch (err) {
-      // A cancelled request ends cleanly — don't mislabel it a retryable error.
-      if (options.signal?.aborted || (err as Error)?.name === 'AbortError') return;
+      cleanupWatchdog();
+      // A user-cancelled request ends cleanly — don't mislabel it retryable.
+      if (options.signal?.aborted) return;
+      if (watchdog.idleFired()) {
+        yield {
+          type: 'error',
+          code: 'network',
+          message:
+            `no response from ${baseUrl} for ${idleTimeoutMs / 1000}s — ` +
+            'the server may be down or unresponsive',
+          retryable: true,
+        };
+        return;
+      }
+      if ((err as Error)?.name === 'AbortError') return;
       yield {
         type: 'error',
         code: 'network',
-        message: err instanceof Error ? err.message : String(err),
+        message: describeTransportError(err),
         retryable: true,
       };
       return;
     }
 
+    resetIdle(); // headers arrived — give time-to-first-token its own full window
+
     if (!res.ok || !res.body) {
+      cleanupWatchdog();
       const detail = await res.text().catch(() => '');
       let reason = detail;
       try {
@@ -416,6 +450,7 @@ export function createOllamaProvider(cfg: ProviderConfig): ModelProvider {
     try {
       while (true) {
         const { done, value } = await reader.read();
+        resetIdle(); // any activity (bytes or clean end) proves the socket is alive
         if (done) break;
         for (const line of decoder.push(value)) {
           yield* handleChunk(line.data);
@@ -425,18 +460,33 @@ export function createOllamaProvider(cfg: ProviderConfig): ModelProvider {
         yield* handleChunk(line.data);
       }
     } catch (err) {
-      // A cancelled request (AbortSignal) ends cleanly; any other mid-stream
-      // failure (connection reset, malformed NDJSON) is surfaced as a
-      // recoverable ErrorDelta rather than thrown out of the generator.
-      if (options.signal?.aborted || (err as Error)?.name === 'AbortError') {
+      // A user-cancelled request (AbortSignal) ends cleanly; a watchdog abort
+      // or any other mid-stream failure (connection reset, malformed NDJSON)
+      // is surfaced as a recoverable ErrorDelta rather than thrown.
+      if (options.signal?.aborted) return;
+      if (watchdog.idleFired()) {
+        yield {
+          type: 'error',
+          code: 'network',
+          message:
+            `stream stalled: no data from ${baseUrl} for ` +
+            `${idleTimeoutMs / 1000}s — the server may have crashed`,
+          retryable: true,
+        };
         return;
       }
+      if ((err as Error)?.name === 'AbortError') return;
       yield {
         type: 'error',
         code: 'network',
-        message: err instanceof Error ? err.message : String(err),
+        message: describeTransportError(err),
         retryable: true,
       };
+    } finally {
+      cleanupWatchdog();
+      // If the consumer abandoned the generator mid-stream (gen.return()),
+      // abort the request so the socket doesn't keep streaming to nowhere.
+      watchdog.abort();
     }
   }
 

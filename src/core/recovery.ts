@@ -63,13 +63,24 @@ export function toolFingerprint(toolUses: ToolUseBlock[]): string {
 }
 
 /**
+ * A stall (narration or deferral) is characteristically SHORT — "I'll create
+ * the file", "Please provide the song name". A long reply that delivers real
+ * content is a final answer, even when it opens with "Here's…" or closes with
+ * a courtesy "Would you like more details?". Nudging such an answer makes the
+ * model "complete" a task that never existed — it reaches for the most recent
+ * task in history and replays it (observed live: a fully-answered question got
+ * nudged and the model re-ran an old file write).
+ */
+const STALL_MAX_LENGTH = 400;
+
+/**
  * True if the assistant text reads like the model DESCRIBING an action it hasn't
  * taken ("I'll read…", "let me run…", "sure, here's how…") rather than a final
  * answer — used to nudge a weak model to actually emit the tool call.
  */
 export function looksLikeNarration(text: string): boolean {
   const t = text.trim();
-  if (t.length === 0) return false;
+  if (t.length === 0 || t.length > STALL_MAX_LENGTH) return false;
   return /^(sure|okay|ok|alright|here('s| is)|let me|i(\s|')?(ll|'ll| will| am going to| can| should)|now i|first,? i|to (do|create|write|read|run|make))\b/i.test(
     t,
   );
@@ -78,16 +89,31 @@ export function looksLikeNarration(text: string): boolean {
 /**
  * True if the assistant text DEFERS — asks the user to make a trivial choice or
  * supply a value the agent could pick itself ("please provide the name…",
- * "would you like…"), or ends on a question — instead of just acting. Paired with
- * a no-tool-call turn on an actionable task, it's a stall to nudge past.
+ * "would you like…") — instead of just acting. Paired with a no-tool-call turn
+ * on an actionable task, it's a stall to nudge past.
  */
 export function looksLikeDeferral(text: string): boolean {
   const t = text.trim();
   if (t.length === 0) return false;
-  return (
-    /\b(please (provide|specify|give me|tell me|confirm|let me know)|provide me|could you|would you like|do you want|shall i|which (one|file|name|option)|what (name|should|would|do you)|let me know|if you('d| would| want)|once you('ve| have)|waiting for (you|your)|need you to)\b/i.test(
+  // A deferral asks the user to SUPPLY or CHOOSE something the model should
+  // have defaulted. A bare trailing "?" is NOT enough — a friendly "How can I
+  // help?" after a greeting is a legitimate final reply, not a stall. And in a
+  // LONG reply the ask must be the OPENING (the substance), not a courtesy
+  // trailer after a complete answer.
+  const phrase =
+    /\b(please (provide|specify|give me|tell me|confirm|let me know)|provide me|could you|would you like|do you want|shall i|which (one|file|name|option)|what (name|should|would|do you)|let me know|if you('d| would| want)|once you('ve| have)|waiting for (you|your)|need you to)\b/i.exec(
       t,
-    ) || /\?\s*$/.test(t)
+    );
+  if (phrase && (t.length <= STALL_MAX_LENGTH || phrase.index < 160)) {
+    return true;
+  }
+  // Question form that names the missing value ("What's the file name?",
+  // "What should the content be?") — still a deferral when it IS the reply.
+  return (
+    t.length <= STALL_MAX_LENGTH &&
+    /\bwhat('s| is)?( the)? \w* ?(file|path|folder|directory|name|value|text|content|url)\b.*\?\s*$/i.test(
+      t,
+    )
   );
 }
 

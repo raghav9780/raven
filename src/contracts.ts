@@ -1323,16 +1323,42 @@ export interface AgentRunResult {
 
 /** Credentials/endpoint for one provider backend. */
 export interface ProviderConfig {
-  /** Adapter id: "anthropic" | "ollama" | "openai" | "gemini". */
+  /** Unique name for this entry (referenced by models and --provider). */
   id: string;
+  /**
+   * Adapter dialect this backend speaks: "ollama" | "openai" (more to come).
+   * Defaults to `id`, so `{id:"ollama"}` and `{id:"openai"}` just work while
+   * `{id:"deepseek", type:"openai"}` names a custom entry using the
+   * OpenAI-compatible adapter.
+   */
+  type?: string;
   /** Base URL override (e.g. local Ollama, an OpenAI-compatible gateway). */
   baseUrl?: string;
   /** API key or the name of the env var holding it (`env:ANTHROPIC_API_KEY`). */
   apiKey?: string;
   /** Extra headers merged into every request (e.g. OpenRouter HTTP-Referer). */
   headers?: Record<string, string>;
+  /**
+   * When true, this is the provider Raven uses by default (no `--provider`
+   * needed). Flip `active` between entries to switch local ↔ API. If several
+   * are marked active the FIRST wins; `--provider` always overrides.
+   */
+  active?: boolean;
+  /**
+   * Default model for THIS provider, chosen when no `--model` is given and the
+   * global `defaultModel` isn't one of this provider's models. Lets local and
+   * API modes each keep their own sensible default.
+   */
+  defaultModel?: string;
   /** Default request timeout in ms. */
   timeoutMs?: number;
+  /**
+   * Streaming inactivity window in ms: abort a chat request when the
+   * connection produces no bytes for this long (resets on every chunk).
+   * Distinct from `timeoutMs` (discovery/one-shot requests) — a short
+   * discovery timeout must not choke a slow-loading local model.
+   */
+  idleTimeoutMs?: number;
 }
 
 /** A named model entry binding an id to a provider + capabilities. */

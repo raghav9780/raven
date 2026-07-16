@@ -1,0 +1,18 @@
+{
+  "defaultModel": "qwen2.5-coder:7b",
+  "providers": [
+    {
+      "id": "ollama",
+      "active": false,
+      "defaultModel": "qwen2.5-coder:7b"
+    },
+    {
+      "id": "petroit",
+      "active": true,
+      "type": "openai",
+      "baseUrl": "https://ollama.petroit.ai",
+      "apiKey": "env:PETROIT_API_KEY",
+      "defaultModel": "qwen3:30b"
+    }
+  ]
+}

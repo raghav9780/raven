@@ -13,6 +13,44 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { Config, ProviderConfig } from '../contracts.ts';
 
+/**
+ * Minimal `.env` loader (zero-dependency; no dotenv package). Parses simple
+ * `KEY=VALUE` lines from `<cwd>/.env` then `~/.raven/.env` and populates
+ * `process.env` — WITHOUT overwriting a variable already set in the real
+ * environment (an explicit `$env:VAR` / shell export always wins). This is what
+ * lets `apiKey: "env:PETROIT_API_KEY"` resolve from a local file the user never
+ * has to export by hand. Supports `# comments`, blank lines, `export KEY=…`,
+ * and single/double-quoted values. Values are NOT variable-expanded.
+ */
+export function loadDotEnv(cwd: string): void {
+  const files = [join(cwd, '.env'), join(homedir(), '.raven', '.env')];
+  for (const file of files) {
+    if (!existsSync(file)) continue;
+    let text: string;
+    try {
+      text = readFileSync(file, 'utf8');
+    } catch {
+      continue;
+    }
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (line.length === 0 || line.startsWith('#')) continue;
+      const body = line.startsWith('export ') ? line.slice('export '.length) : line;
+      const eq = body.indexOf('=');
+      if (eq <= 0) continue;
+      const key = body.slice(0, eq).trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+      if (process.env[key] !== undefined) continue; // real env wins
+      let value = body.slice(eq + 1).trim();
+      const quote = value[0];
+      if ((quote === '"' || quote === "'") && value[value.length - 1] === quote) {
+        value = value.slice(1, -1);
+      }
+      process.env[key] = value;
+    }
+  }
+}
+
 /** A partial, on-disk view of the config; every field is optional. */
 export type PartialConfig = Partial<Config>;
 

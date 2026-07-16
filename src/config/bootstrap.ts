@@ -8,7 +8,7 @@
  * for fields a backend omits.
  */
 
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { userConfigPath, configFilesFor } from './load.ts';
 import type { PartialConfig } from './load.ts';
@@ -90,12 +90,30 @@ function persistDefault(model: ModelConfig, providerBaseUrl?: string): void {
   const path = userConfigPath();
   try {
     mkdirSync(dirname(path), { recursive: true });
+    // MERGE with the existing file — persisting a new default must never wipe
+    // other providers/models/settings the user has configured by hand.
+    let existing: PartialConfig = {};
+    try {
+      existing = JSON.parse(readFileSync(path, 'utf8')) as PartialConfig;
+    } catch {
+      // no file yet / unreadable → start fresh
+    }
+    const providers = [...(existing.providers ?? [])];
+    if (!providers.some((p) => p.id === model.provider)) {
+      providers.push({
+        id: model.provider,
+        ...(providerBaseUrl ? { baseUrl: providerBaseUrl } : {}),
+      });
+    }
+    const models = [
+      ...(existing.models ?? []).filter((m) => m.name !== model.name),
+      model,
+    ];
     const toWrite: PartialConfig = {
+      ...existing,
       defaultModel: model.name,
-      providers: [
-        { id: model.provider, ...(providerBaseUrl ? { baseUrl: providerBaseUrl } : {}) },
-      ],
-      models: [model],
+      providers,
+      models,
     };
     writeFileSync(path, `${JSON.stringify(toWrite, null, 2)}\n`, 'utf8');
   } catch {
@@ -120,25 +138,45 @@ export async function resolveConfig(
     );
   }
 
+  // Models the user declared for this provider in config. They serve as a
+  // fallback when live discovery is unavailable (an API gateway without a
+  // /models endpoint) and their profiles override discovered capabilities.
+  const declared = (partial.models ?? []).filter(
+    (m) => m.provider === providerId,
+  );
+  const declaredAsDiscovered = declared.map((m) => ({
+    modelId: m.modelId,
+    provider: providerId,
+  }));
+
   let discovered;
   try {
     discovered = provider.listModels ? await provider.listModels() : [];
   } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    throw new StartupError(
-      `Could not reach the "${providerId}" backend: ${detail}. ` +
-        (providerId === 'ollama'
-          ? 'Is Ollama running? Start it with `ollama serve` (or launch the Ollama app).'
-          : 'Check the provider baseUrl and that the service is up.'),
-    );
+    if (declaredAsDiscovered.length > 0) {
+      discovered = declaredAsDiscovered; // config keeps us usable offline
+    } else {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new StartupError(
+        `Could not reach the "${providerId}" backend: ${detail}. ` +
+          (providerId === 'ollama'
+            ? 'Is Ollama running? Start it with `ollama serve` (or launch the Ollama app).'
+            : 'Check the provider baseUrl/apiKey and that the service is up, ' +
+              'or declare its models in the config `models` array.'),
+      );
+    }
   }
   if (discovered.length === 0) {
-    throw new NoModelsError(
-      `No models found for provider "${providerId}". ` +
-        (providerId === 'ollama'
-          ? 'Start Ollama and pull a model, e.g. `ollama pull llama3.1`.'
-          : 'Configure at least one model for this provider.'),
-    );
+    if (declaredAsDiscovered.length > 0) {
+      discovered = declaredAsDiscovered;
+    } else {
+      throw new NoModelsError(
+        `No models found for provider "${providerId}". ` +
+          (providerId === 'ollama'
+            ? 'Start Ollama and pull a model, e.g. `ollama pull llama3.1`.'
+            : 'Configure at least one model for this provider.'),
+      );
+    }
   }
 
   // Validate an explicit --model up front so a typo fails cleanly (and is never
@@ -150,17 +188,29 @@ export async function resolveConfig(
     );
   }
 
-  const persistedDefault = partial.defaultModel;
-  const stillLive =
-    persistedDefault &&
-    discovered.some((m) => m.modelId === persistedDefault);
+  // Preferred default: this provider's own `defaultModel` (so local and API
+  // modes keep separate defaults) falling back to the global `defaultModel`.
+  // Used only when it's actually one of this provider's live models; else the
+  // first discovered model wins. An explicit --model always overrides.
+  const providerEntry = partial.providers?.find((p) => p.id === providerId);
+  const preferred = providerEntry?.defaultModel ?? partial.defaultModel;
+  const preferredLive =
+    preferred && discovered.some((m) => m.modelId === preferred);
   const chosenId =
-    opts.model ??
-    (stillLive ? persistedDefault : discovered[0].modelId);
+    opts.model ?? (preferredLive ? preferred : discovered[0].modelId);
 
-  const profile = provider.describeModel
+  const liveProfile = provider.describeModel
     ? await provider.describeModel(chosenId)
     : provider.capabilities(chosenId);
+  // A profile declared for this model in config overrides discovered fields
+  // (cloud backends can't be introspected; users may also pin e.g. a smaller
+  // context window than the backend advertises).
+  const declaredModel = declared.find(
+    (m) => m.modelId === chosenId || m.name === chosenId,
+  );
+  const profile = declaredModel?.profile
+    ? { ...liveProfile, ...declaredModel.profile }
+    : liveProfile;
 
   const model: ModelConfig = {
     name: chosenId,
@@ -187,7 +237,9 @@ export async function resolveConfig(
     logLevel: partial.logLevel ?? 'info',
   };
 
-  if (opts.persist !== false && !stillLive) {
+  // Persist only when the resolved default actually changed, so a normal run
+  // doesn't rewrite the user config every time.
+  if (opts.persist !== false && partial.defaultModel !== chosenId) {
     persistDefault(model, baseUrl);
   }
 
