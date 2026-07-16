@@ -23,6 +23,8 @@ export const DEFAULT_IGNORE_DIRS: readonly string[] = [
 
 /** Hard cap on files visited so a huge tree can't hang the agent. */
 const MAX_FILES = 20_000;
+/** Cap on matches RETURNED to the model so a broad pattern can't flood context. */
+const MAX_RESULTS = 500;
 
 /** Translate a glob pattern into an anchored RegExp (POSIX-style forward slashes). */
 export function globToRegExp(pattern: string): RegExp {
@@ -86,15 +88,25 @@ export function walkFiles(
 export const globTool: Tool = {
   name: 'glob',
   description:
-    'Find files by glob pattern (e.g. "**/*.ts", "src/*.json"). Returns matching ' +
-    'paths relative to the working directory. Supports **, *, and ?.',
+    'Find files by glob pattern, OR list the files in a directory. To list/search ' +
+    'a specific folder, set `path` to that folder and use pattern "*" (its files) ' +
+    'or "**" (recurse). `pattern` is matched relative to `path`. Examples: ' +
+    '{"path":"C:/proj/src","pattern":"*"} lists src\'s files; {"pattern":"**/*.ts"} ' +
+    'finds all .ts under the working dir. Supports **, *, and ?.',
   inputSchema: {
     type: 'object',
     properties: {
-      pattern: { type: 'string', description: 'Glob pattern to match.' },
+      pattern: {
+        type: 'string',
+        description:
+          'Glob pattern (e.g. "*", "**", "**/*.ts"). May also be an absolute ' +
+          'directory path to list that directory.',
+      },
       path: {
         type: 'string',
-        description: 'Base directory to search (default: working directory).',
+        description:
+          'Directory to search/list (absolute or relative; default: working ' +
+          'directory). Set this to list a specific folder.',
       },
     },
     required: ['pattern'],
@@ -104,16 +116,34 @@ export const globTool: Tool = {
   mutates: false,
 
   execute(args: JsonObject, ctx: ToolContext): Promise<ToolResult> {
-    const pattern = typeof args.pattern === 'string' ? args.pattern : '';
+    let pattern = typeof args.pattern === 'string' ? args.pattern : '';
     if (pattern.length === 0) {
       return Promise.resolve({ ok: false, content: 'No pattern provided.' });
     }
-    const base =
-      typeof args.path === 'string' && args.path.length > 0
-        ? isAbsolute(args.path)
-          ? args.path
-          : resolve(ctx.cwd, args.path)
-        : ctx.cwd;
+    const explicitPath =
+      typeof args.path === 'string' && args.path.length > 0 ? args.path : '';
+    let base = explicitPath
+      ? isAbsolute(explicitPath)
+        ? explicitPath
+        : resolve(ctx.cwd, explicitPath)
+      : ctx.cwd;
+
+    // Robustness: models often put an absolute directory INSIDE the pattern
+    // (e.g. pattern="C:/dir/NotificationHandler" or ".../*") and omit `path`.
+    // When no explicit path is given and the pattern is absolute, split its
+    // leading non-glob directory prefix into the base and keep the rest as the
+    // pattern (a bare directory → list it with "*").
+    if (!explicitPath && isAbsolute(pattern)) {
+      const segments = pattern.split(/[\\/]+/);
+      const globAt = segments.findIndex((s) => /[*?]/.test(s));
+      if (globAt === -1) {
+        base = pattern; // pure path → list the directory
+        pattern = '*';
+      } else if (globAt > 0) {
+        base = segments.slice(0, globAt).join('/');
+        pattern = segments.slice(globAt).join('/');
+      }
+    }
 
     const re = globToRegExp(pattern);
     const matches: string[] = [];
@@ -122,14 +152,24 @@ export const globTool: Tool = {
       if (re.test(rel)) matches.push(relative(ctx.cwd, file).split('\\').join('/'));
     }
     matches.sort();
+    // Cap the returned list: a broad pattern (e.g. "**/*" over a home directory)
+    // can match tens of thousands of files and blow up the context window. Show
+    // the first MAX_RESULTS and tell the model how to narrow.
+    const shown = matches.slice(0, MAX_RESULTS);
+    const truncated = matches.length > shown.length;
     const content =
       matches.length === 0
         ? `No files match ${pattern}`
-        : matches.join('\n');
+        : shown.join('\n') +
+          (truncated
+            ? `\n… [showing the first ${MAX_RESULTS} of ${matches.length} matches — ` +
+              'narrow the pattern (e.g. "*.cs") or set `path` to a specific subdirectory]'
+            : '');
     return Promise.resolve({
       ok: true,
       content,
-      meta: { count: matches.length },
+      truncated,
+      meta: { count: matches.length, shown: shown.length },
     });
   },
 };

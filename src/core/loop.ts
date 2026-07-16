@@ -12,14 +12,19 @@
 import { buildRequest, reduceStream } from './messages.ts';
 import { parseTextToolCalls } from './parser.ts';
 import { compactMessages } from './compact.ts';
+import { coerceArgs, validateArgs } from '../tools/validate.ts';
+import { renderTodoReminder } from '../tools/todo.ts';
 import {
   backoffDelay,
   isRetryable,
+  looksLikeDeferral,
   looksLikeNarration,
+  looksLikeSuccessClaim,
   sleepWithAbort,
   toolFingerprint,
 } from './recovery.ts';
 import {
+  lastToolResultErrored,
   recordAssistantMessage,
   recordCompaction,
   recordError,
@@ -42,6 +47,7 @@ import type {
   PermissionChecker,
   Session,
   StreamDelta,
+  TodoItem,
   ToolContext,
   ToolResult,
   ToolUseBlock,
@@ -61,6 +67,9 @@ export interface LoopDeps {
   /** Reconciled assistant prose for a turn, emitted once AFTER recovery has
    *  stripped any text-encoded tool call. Empty on pure tool-call turns. */
   onAssistantText?: (text: string) => void;
+  /** Out-of-band notice to the user (not model prose): e.g. a diagnostic that the
+   *  model may not support the tools API. Optional; the UI prints it dimmed. */
+  onNotice?: (text: string) => void;
   /** Called after new events are appended so a writer can flush the transcript
    *  tail (crash-safe incremental persistence); optional. */
   persist?: (session: Session) => void;
@@ -75,6 +84,7 @@ async function executeToolUse(
   session: Session,
   opts: AgentLoopOptions,
   deps: LoopDeps,
+  todos: { items: TodoItem[] },
 ): Promise<void> {
   recordToolCall(session, toolUse.id, toolUse.name, toolUse.input);
 
@@ -103,6 +113,24 @@ async function executeToolUse(
     return;
   }
 
+  // Coerce stringified scalars toward the schema's declared types ("5000"→5000,
+  // "true"→true) — local models often stringify args. Type-only, so it doesn't
+  // affect the permission decision already made above. Then schema-validate the
+  // coerced args (missing/wrong/unexpected fields) with a uniform, tool-aware
+  // message so the model corrects (and picks the right tool) instead of hitting
+  // an ad-hoc per-tool error.
+  const coerced = coerceArgs(tool.inputSchema, toolUse.input);
+  const invalid = validateArgs(
+    tool.name,
+    tool.inputSchema,
+    coerced,
+    tool.disambiguationHint,
+  );
+  if (invalid) {
+    recordToolResult(session, toolUse.id, { ok: false, content: invalid.message });
+    return;
+  }
+
   const ctx: ToolContext = {
     cwd: session.cwd,
     checkPermission: deps.checkPermission,
@@ -111,9 +139,14 @@ async function executeToolUse(
     paths: deps.paths,
     depthRemaining: opts.maxSubagentDepth,
     env: {},
+    // Run-scoped plan: the todo_write tool sets it; the loop re-injects it as a
+    // <system-reminder> each turn. Copy so the tool can't mutate it after return.
+    setTodos: (items) => {
+      todos.items = items.slice();
+    },
   };
 
-  const input = (decision.updatedInput ?? toolUse.input) as JsonObject;
+  const input = (decision.updatedInput ?? coerced) as JsonObject;
   let result: ToolResult;
   try {
     result = await tool.execute(input, ctx);
@@ -121,7 +154,26 @@ async function executeToolUse(
     const message = err instanceof Error ? err.message : String(err);
     result = { ok: false, content: `Tool threw: ${message}` };
   }
-  recordToolResult(session, toolUse.id, result);
+  recordToolResult(session, toolUse.id, capToolResult(result));
+}
+
+/** Defense-in-depth: no single tool result may exceed this many characters. A
+ *  tool that ignores its own budget (or a future tool with none) can otherwise
+ *  push one giant observation into the context and blow the model window. */
+const MAX_TOOL_RESULT_CHARS = 40_000;
+
+function capToolResult(result: ToolResult): ToolResult {
+  if (typeof result.content !== 'string') return result;
+  if (result.content.length <= MAX_TOOL_RESULT_CHARS) return result;
+  const dropped = result.content.length - MAX_TOOL_RESULT_CHARS;
+  return {
+    ...result,
+    content:
+      result.content.slice(0, MAX_TOOL_RESULT_CHARS) +
+      `\n… [tool output truncated: ${dropped} more chars dropped to protect the ` +
+      'context window — narrow the request]',
+    truncated: true,
+  };
 }
 
 /**
@@ -138,10 +190,32 @@ export async function runAgentLoop(
   let finalText = '';
   // Stuck-loop + narration-nudge guards (bounded, reset on progress).
   const MAX_REPEATS = 2;
-  const MAX_NUDGES = 1;
+  const MAX_NUDGES = 2;
+  // One corrective feedback before the hard loop-stop (see the guard below).
+  const MAX_LOOP_NUDGES = 1;
+  let loopNudges = 0;
+  // tools-ignored diagnostic: if the model is advertised native-tools-capable
+  // but never emits a native call and then stalls, warn the user once.
+  const toolsAdvertised = deps.registry.specs().length > 0;
+  let sawNativeToolCall = false;
+  let toolsIgnoredNoticed = false;
+  const warnToolsIgnoredOnStall = (): void => {
+    if (toolsIgnoredNoticed) return;
+    if (opts.nativeTools === true && toolsAdvertised && !sawNativeToolCall) {
+      toolsIgnoredNoticed = true;
+      deps.onNotice?.(
+        'The model produced no native tool calls and stalled. This model/endpoint ' +
+          'may be ignoring the tools API — if it keeps describing actions instead of ' +
+          'doing them, switch to a tools-capable model (e.g. via /model).',
+      );
+    }
+  };
   let lastFingerprint = '';
   let repeatCount = 0;
   let nudges = 0;
+  // Run-scoped working plan (the todo_write tool sets it via ctx.setTodos); the
+  // loop re-injects it as an ephemeral <system-reminder> each turn.
+  const todos: { items: TodoItem[] } = { items: [] };
 
   while (turns < opts.maxTurns) {
     if (opts.signal?.aborted) {
@@ -172,6 +246,16 @@ export async function runAgentLoop(
         before: compaction.before,
         after: compaction.after,
       });
+    }
+
+    // Re-inject the working plan as an EPHEMERAL system-reminder (not persisted
+    // to the event log — it's rebuilt from the live list each turn), so a weak
+    // model keeps the remaining steps in view. Appended last = most recent.
+    if (todos.items.length > 0) {
+      messages = [
+        ...messages,
+        { role: 'user', content: [{ type: 'text', text: renderTodoReminder(todos.items) }] },
+      ];
     }
 
     const chatOptions: ChatOptions = {
@@ -229,6 +313,10 @@ export async function runAgentLoop(
       break;
     }
 
+    // Record whether the PROVIDER returned a native tool call this turn (before
+    // text-recovery may synthesize one) — drives the tools-ignored diagnostic.
+    if (turn.toolUses.length > 0) sawNativeToolCall = true;
+
     // Text-protocol fallback (ADR-0011): if the model emitted NO native tool
     // call, try to recover one from its text — small local models (e.g.
     // qwen2.5-coder via Ollama) often emit tool calls as JSON / `<tool_call>`
@@ -272,40 +360,96 @@ export async function runAgentLoop(
     recordUsage(session, turn.usage, opts.model);
     deps.persist?.(session);
     finalText = textOf(turn.content);
-    // Emit the reconciled prose ONCE, now that recovery has removed any
-    // text-encoded tool call — the UI streams nothing raw before this point.
-    if (finalText.trim().length > 0) deps.onAssistantText?.(finalText);
 
     if (turn.toolUses.length === 0) {
-      // Narration nudge: a weak model sometimes DESCRIBES an action instead of
-      // emitting the tool call. Once per stall, remind it to act, then continue.
-      if (nudges < MAX_NUDGES && looksLikeNarration(finalText)) {
+      // Error gate: a failed last action + a "done"-style final message is a
+      // hallucinated success. Reject it once — tell the model the truth and let
+      // it retry or report honestly — instead of printing the false claim.
+      if (
+        nudges < MAX_NUDGES &&
+        lastToolResultErrored(session) &&
+        looksLikeSuccessClaim(finalText)
+      ) {
         nudges += 1;
         recordUserMessage(session, [
           {
             type: 'text',
             text:
-              'You described an action but did not perform it. If a tool is ' +
-              'needed, emit the tool call now — do NOT describe it or put it in ' +
-              'a code fence. If the task is already done, say so plainly.',
+              'The last tool call FAILED (see the error result above), so the ' +
+              'task is NOT complete. Do not claim success. Either retry with ' +
+              'corrected arguments or a more suitable tool, or state plainly ' +
+              'what failed and why.',
           },
         ]);
         deps.persist?.(session);
         continue;
       }
+      // Stall nudge: a weak model sometimes DESCRIBES an action instead of doing
+      // it, or DEFERS by asking the user for a value it could pick itself. Nudge
+      // it to choose defaults and act, then continue (bounded by MAX_NUDGES).
+      if (
+        nudges < MAX_NUDGES &&
+        (looksLikeNarration(finalText) || looksLikeDeferral(finalText))
+      ) {
+        nudges += 1;
+        recordUserMessage(session, [
+          {
+            type: 'text',
+            text:
+              'You have NOT completed the task. Do not describe the action, and ' +
+              'do not ask me to make trivial choices or supply values you can ' +
+              'pick yourself (file names, sample text, a song\'s words, etc.) — ' +
+              'choose sensible defaults and emit the tool call NOW. Only stop to ' +
+              'ask if you are genuinely blocked (e.g. missing credentials), and ' +
+              'if so say exactly what is blocking. If the task is already done, ' +
+              'say so plainly with no tool call.',
+          },
+        ]);
+        deps.persist?.(session);
+        continue;
+      }
+      // Accepted as the final answer — emit the reconciled prose ONCE (recovery
+      // has already stripped any text-encoded tool call; nothing streamed raw).
+      if (finalText.trim().length > 0) deps.onAssistantText?.(finalText);
+      // If this "final" turn is really a stall (narration/deferral) and the model
+      // never made a native call, it likely can't tool-call — surface it once.
+      if (looksLikeNarration(finalText) || looksLikeDeferral(finalText)) {
+        warnToolsIgnoredOnStall();
+      }
       stopReason = 'no_tool_use';
       break;
     }
+    // Tool-use turn: show any leftover prose that accompanied the call(s).
+    if (finalText.trim().length > 0) deps.onAssistantText?.(finalText);
     nudges = 0; // a tool call is progress
 
-    // Stuck-loop guard: the same tool call(s) repeated with no progress. Record
-    // synthetic results (no orphaned tool_use) and stop instead of looping.
+    // Stuck-loop guard: the same tool call(s) repeated with no progress.
     const fingerprint = toolFingerprint(turn.toolUses);
     if (fingerprint === lastFingerprint) {
       repeatCount += 1;
     } else {
       repeatCount = 0;
       lastFingerprint = fingerprint;
+    }
+    // First repeat: don't run the identical call again — give the model ONE
+    // corrective shot with actionable feedback (it often omitted a required
+    // argument, e.g. a directory path) instead of silently giving up. Synthesize
+    // results so no tool_use is left orphaned, then let it retry.
+    if (repeatCount >= 1 && loopNudges < MAX_LOOP_NUDGES) {
+      loopNudges += 1;
+      for (const toolUse of turn.toolUses) {
+        recordToolResult(session, toolUse.id, {
+          ok: false,
+          content:
+            'Skipped: this call is identical to your previous one and gives the ' +
+            'same result. Do NOT repeat it. Re-read the user\'s request and the ' +
+            "tool's parameters — you likely left out a required argument (for " +
+            'example a directory/path the user specified). Change the arguments ' +
+            'and make a DIFFERENT call, or give your final answer.',
+        });
+      }
+      deps.persist?.(session);
+      continue;
     }
     if (repeatCount >= MAX_REPEATS) {
       for (const toolUse of turn.toolUses) {
@@ -336,7 +480,7 @@ export async function runAgentLoop(
         aborted = true;
         break;
       }
-      await executeToolUse(turn.toolUses[i], session, opts, deps);
+      await executeToolUse(turn.toolUses[i], session, opts, deps, todos);
       deps.persist?.(session);
     }
 

@@ -47,6 +47,18 @@ export const readTool: Tool = {
     try {
       text = await readFile(absolute, 'utf8');
     } catch (err) {
+      const code = (err as { code?: string }).code;
+      // A directory is a valid path, just not readable as a file. Steer the model
+      // to glob (list its files) instead of letting it conclude "invalid path".
+      if (code === 'EISDIR') {
+        return {
+          ok: false,
+          content:
+            `${rawPath} is a directory, not a file. To list the files in it, use ` +
+            `the glob tool with path="${rawPath}" and pattern "*" (or "**" to ` +
+            `recurse); to read a file, pass that file's full path.`,
+        };
+      }
       const message = err instanceof Error ? err.message : String(err);
       return { ok: false, content: `Could not read ${rawPath}: ${message}` };
     }

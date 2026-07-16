@@ -29,6 +29,9 @@ export const writeTool: Tool = {
   },
   concurrencySafe: false,
   mutates: true,
+  disambiguationHint:
+    '`write` replaces a whole file and needs `path` + `content`. For a small ' +
+    'in-place change use `edit`; to rename or move a file use `move`.',
 
   async execute(args: JsonObject, ctx: ToolContext): Promise<ToolResult> {
     const rawPath = typeof args.path === 'string' ? args.path : '';

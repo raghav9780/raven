@@ -25,6 +25,50 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
+/**
+ * Whitespace-flexible fallback (Aider's `perfect_or_whitespace` idea): when
+ * `oldString` doesn't match verbatim, match a contiguous run of lines whose
+ * content is equal after trimming each line's leading/trailing whitespace — so a
+ * model that re-indented its quote still lands the edit. Returns the rewritten
+ * text and how many runs matched (0 = no match). Line-based, so it only helps
+ * multi-/single-line quotes that differ solely by indentation, never by content.
+ */
+function applyFlexible(
+  original: string,
+  oldString: string,
+  newString: string,
+  replaceAll: boolean,
+): { updated: string; count: number } {
+  const origLines = original.split('\n');
+  const oldTrimmed = oldString.split('\n').map((l) => l.trim());
+  const newLines = newString.split('\n');
+  const m = oldTrimmed.length;
+  const ranges: Array<[number, number]> = [];
+  for (let i = 0; i + m <= origLines.length; i += 1) {
+    let hit = true;
+    for (let j = 0; j < m; j += 1) {
+      if (origLines[i + j].trim() !== oldTrimmed[j]) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit) {
+      ranges.push([i, i + m]);
+      i += m - 1; // non-overlapping
+    }
+  }
+  if (ranges.length === 0) return { updated: original, count: 0 };
+  if (ranges.length > 1 && !replaceAll) return { updated: original, count: ranges.length };
+
+  const targets = replaceAll ? ranges : [ranges[0]];
+  const out = origLines.slice();
+  // Splice from the last match backward so earlier indices stay valid.
+  for (let k = targets.length - 1; k >= 0; k -= 1) {
+    out.splice(targets[k][0], targets[k][1] - targets[k][0], ...newLines);
+  }
+  return { updated: out.join('\n'), count: targets.length };
+}
+
 /** A minimal line-oriented diff of the changed region (context-free). */
 function miniDiff(oldStr: string, newStr: string): string {
   const removed = oldStr.split('\n').map((l) => `- ${l}`);
@@ -60,6 +104,9 @@ export const editTool: Tool = {
   },
   concurrencySafe: false,
   mutates: true,
+  disambiguationHint:
+    '`edit` does a surgical find/replace and needs `old_string` + `new_string`. ' +
+    'To overwrite a whole file use `write`; to rename or move a file use `move`.',
 
   async execute(args: JsonObject, ctx: ToolContext): Promise<ToolResult> {
     const rawPath = typeof args.path === 'string' ? args.path : '';
@@ -84,25 +131,42 @@ export const editTool: Tool = {
     }
 
     const occurrences = countOccurrences(original, oldString);
-    if (occurrences === 0) {
-      return {
-        ok: false,
-        content: `old_string not found in ${rawPath}. It must match the file exactly (whitespace included).`,
-      };
+    let updated: string;
+    let replacements: number;
+    let flexible = false;
+    if (occurrences > 0) {
+      if (occurrences > 1 && !replaceAll) {
+        return {
+          ok: false,
+          content: `old_string is not unique in ${rawPath} (${occurrences} matches). Add surrounding context to make it unique, or set replace_all.`,
+        };
+      }
+      // Use split/join (replace_all) or a replacer FUNCTION (single) so special
+      // replacement patterns in new_string ($$, $&, $`, $') are inserted
+      // literally rather than interpreted by String.prototype.replace.
+      updated = replaceAll
+        ? original.split(oldString).join(newString)
+        : original.replace(oldString, () => newString);
+      replacements = replaceAll ? occurrences : 1;
+    } else {
+      // No verbatim match — try the whitespace-flexible fallback before failing.
+      const flex = applyFlexible(original, oldString, newString, replaceAll);
+      if (flex.count === 0) {
+        return {
+          ok: false,
+          content: `old_string not found in ${rawPath}. It must match the file contents (a whitespace-flexible match also failed — check for typos, not just indentation).`,
+        };
+      }
+      if (flex.count > 1 && !replaceAll) {
+        return {
+          ok: false,
+          content: `old_string matches ${flex.count} places in ${rawPath} (ignoring indentation). Add surrounding context to make it unique, or set replace_all.`,
+        };
+      }
+      updated = flex.updated;
+      replacements = flex.count;
+      flexible = true;
     }
-    if (occurrences > 1 && !replaceAll) {
-      return {
-        ok: false,
-        content: `old_string is not unique in ${rawPath} (${occurrences} matches). Add surrounding context to make it unique, or set replace_all.`,
-      };
-    }
-
-    // Use split/join (replace_all) or a replacer FUNCTION (single) so special
-    // replacement patterns in new_string ($$, $&, $`, $') are inserted
-    // literally rather than interpreted by String.prototype.replace.
-    const updated = replaceAll
-      ? original.split(oldString).join(newString)
-      : original.replace(oldString, () => newString);
 
     // Lint-gate: reject an edit that would introduce a syntax error, leaving the
     // file unchanged, so the model sees the problem and can correct it.
@@ -123,11 +187,12 @@ export const editTool: Tool = {
       return { ok: false, content: `Could not write ${rawPath}: ${message}` };
     }
 
-    const replacements = replaceAll ? occurrences : 1;
     return {
       ok: true,
-      content: `Edited ${rawPath} (${replacements} replacement${replacements === 1 ? '' : 's'}):\n${miniDiff(oldString, newString)}`,
-      meta: { path: absolute, replacements },
+      content:
+        `Edited ${rawPath} (${replacements} replacement${replacements === 1 ? '' : 's'}` +
+        `${flexible ? ', whitespace-flexible match' : ''}):\n${miniDiff(oldString, newString)}`,
+      meta: { path: absolute, replacements, flexible },
     };
   },
 };

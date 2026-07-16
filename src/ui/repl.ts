@@ -184,6 +184,7 @@ export async function startRepl(ctx: ReplContext): Promise<void> {
       system: { text: ctx.systemPrompt },
       permissionMode: ctx.gateState.mode,
       maxSubagentDepth: 0,
+      nativeTools: ctx.runtime.profile.nativeTools,
       retry: ctx.retry,
       signal,
     };
@@ -203,6 +204,7 @@ export async function startRepl(ctx: ReplContext): Promise<void> {
       paths: ctx.paths,
       onDelta,
       onAssistantText,
+      onNotice: (text) => { clearSpinner(); out(paint(`${text}\n`, C.dim)); },
       persist: writer.persist,
     };
     try {

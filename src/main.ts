@@ -22,6 +22,8 @@ import { bashTool, SHELL_NAME } from './tools/bash.ts';
 import { readTool } from './tools/read.ts';
 import { writeTool } from './tools/write.ts';
 import { editTool } from './tools/edit.ts';
+import { moveTool } from './tools/move.ts';
+import { todoWriteTool } from './tools/todo.ts';
 import { globTool } from './tools/glob.ts';
 import { grepTool } from './tools/grep.ts';
 import { createGate } from './permissions/gate.ts';
@@ -207,9 +209,11 @@ const TOOL_BLURBS: Record<string, string> = {
   read: "read a file's contents (prefer this over cat/Get-Content)",
   write: 'create or overwrite a whole file',
   edit: 'replace an exact substring in an existing file (read it first)',
-  glob: 'find files by name/glob pattern (prefer this over find/dir)',
+  move: 'rename or move a file/dir (use this for renames — never edit/write)',
+  glob: 'find files by name/glob pattern OR list a directory’s files (prefer this over find/dir; read cannot list a folder)',
   grep: 'search file contents (prefer this over grep/Select-String)',
   bash: 'run shell commands ONLY (build, test, git, install, run scripts)',
+  todo_write: 'track a multi-step plan as a checklist (use for non-trivial tasks)',
 };
 
 /**
@@ -244,8 +248,10 @@ function buildSystemPrompt(
     `How to work — every turn:\n` +
     `- To take an action you MUST use the tool-calling mechanism. NEVER print a tool call as text, JSON, or inside a \`\`\` code fence. NEVER print a shell command in a code fence — put the command in the bash tool's "command" argument so it actually runs.\n` +
     `- Do NOT say what you are about to do ("I'll read…", "let me run…"). Do it: emit the tool call now.\n` +
+    `- Do NOT ask the user to make trivial choices or supply values you can reasonably pick yourself (file names, sample text, a song's words, etc.). Assume sensible defaults, note them in a few words, and proceed with the tool call. Only ask the user when GENUINELY blocked (missing credentials, or a truly destructive/ambiguous action).\n` +
     `- Do exactly ONE step per turn: emit a single tool call, then stop and wait for its result.\n` +
-    `- Use read/write/edit/glob/grep for files; use bash only for running commands.\n` +
+    `- Use read/write/edit/glob/grep for files; use bash only for running commands. To rename or move a file use the \`move\` tool — never \`edit\` or \`write\`.\n` +
+    `- A tool result marked ✗ is a FAILURE. Never state or imply the action succeeded. Either retry with corrected arguments or a more suitable tool, or report plainly what failed — do NOT claim a file was created/renamed/edited unless the tool returned ✓.\n` +
     `- Each turn either CALL a tool OR give your final answer — never neither. When finished, reply with a 1-2 sentence plain-text summary and NO tool call.\n\n` +
     `The bash tool runs ${shellName}. ${shellHint}`;
 
@@ -325,7 +331,9 @@ async function main(): Promise<void> {
     withDisplay(readTool),
     withDisplay(writeTool),
     withDisplay(editTool),
+    withDisplay(moveTool),
     withDisplay(globTool),
+    withDisplay(todoWriteTool),
     withDisplay(grepTool),
   ]);
   const projectRules = loadProjectRules(config.paths.root);
@@ -485,6 +493,7 @@ async function main(): Promise<void> {
     system: { text: systemPrompt },
     permissionMode: gateState.mode,
     maxSubagentDepth: 0,
+    nativeTools: profile.nativeTools,
     retry: config.retry,
     signal: abort.signal,
   };
@@ -495,6 +504,7 @@ async function main(): Promise<void> {
     logger,
     paths: config.paths,
     onAssistantText,
+    onNotice: (text) => process.stderr.write(`\x1b[2m${text}\x1b[0m\n`),
     persist: writer.persist,
   };
   const result = await runAgentLoop(session, loopOptions, deps);

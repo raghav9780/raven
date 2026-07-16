@@ -12,6 +12,10 @@ import { homedir } from 'node:os';
 /** Filenames/dirnames that are protected wherever they appear in a path. */
 const PROTECTED_NAMES = new Set([
   '.git',
+  // The harness's own state dir (sessions/config/logs live here). Protected
+  // wherever it appears so tools can't read transcripts or self-escalate by
+  // editing config; the harness writes it directly, never through a gated tool.
+  '.raven',
   '.ssh',
   '.gnupg',
   '.aws',

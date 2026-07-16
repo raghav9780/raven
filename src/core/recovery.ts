@@ -74,3 +74,32 @@ export function looksLikeNarration(text: string): boolean {
     t,
   );
 }
+
+/**
+ * True if the assistant text DEFERS — asks the user to make a trivial choice or
+ * supply a value the agent could pick itself ("please provide the name…",
+ * "would you like…"), or ends on a question — instead of just acting. Paired with
+ * a no-tool-call turn on an actionable task, it's a stall to nudge past.
+ */
+export function looksLikeDeferral(text: string): boolean {
+  const t = text.trim();
+  if (t.length === 0) return false;
+  return (
+    /\b(please (provide|specify|give me|tell me|confirm|let me know)|provide me|could you|would you like|do you want|shall i|which (one|file|name|option)|what (name|should|would|do you)|let me know|if you('d| would| want)|once you('ve| have)|waiting for (you|your)|need you to)\b/i.test(
+      t,
+    ) || /\?\s*$/.test(t)
+  );
+}
+
+/**
+ * True if the assistant text asserts the task SUCCEEDED (past-tense "done" /
+ * "renamed" / "created" / "fixed" …). Paired with a preceding failed tool result
+ * it flags a hallucinated success the loop should reject rather than accept.
+ */
+export function looksLikeSuccessClaim(text: string): boolean {
+  const t = text.trim();
+  if (t.length === 0) return false;
+  return /\b(done|completed|successful(ly)?|has been|have been|is now|are now|renamed|moved|created|deleted|removed|updated|edited|written|saved|fixed|added|replaced)\b/i.test(
+    t,
+  );
+}

@@ -656,6 +656,22 @@ export interface Logger {
  * Everything a tool needs to run, injected by the loop. Tools are pure over this
  * context — no globals — so they are testable and subagent-safe.
  */
+/** Lifecycle status of one planning todo. */
+export const TodoStatus = {
+  Pending: 'pending',
+  InProgress: 'in_progress',
+  Completed: 'completed',
+} as const;
+export type TodoStatus = (typeof TodoStatus)[keyof typeof TodoStatus];
+
+/** One item on the agent's working plan (see the `todo_write` tool). */
+export interface TodoItem {
+  /** Imperative description of the step. */
+  content: string;
+  /** Where the step stands. */
+  status: TodoStatus;
+}
+
 export interface ToolContext {
   /** Absolute working directory for this execution. */
   cwd: string;
@@ -676,6 +692,12 @@ export interface ToolContext {
   depthRemaining: number;
   /** Environment-ish key/value the tool may read (never secrets by default). */
   env: Record<string, string>;
+  /**
+   * Replace the run's working todo list (the `todo_write` tool uses this). The
+   * loop re-injects the current list as a `<system-reminder>` each turn to keep
+   * the model on-plan. Optional — tools that don't plan ignore it.
+   */
+  setTodos?: (items: TodoItem[]) => void;
 }
 
 /**
@@ -713,6 +735,12 @@ export interface Tool {
   concurrencySafe: boolean;
   /** True if the tool mutates the filesystem/system (drives plan-mode blocking). */
   mutates: boolean;
+  /**
+   * Optional one-line steer appended to a validation error for THIS tool, e.g.
+   * pointing a confused model at a sibling tool ("to rename use `move`"). Lives
+   * on the tool so generic validation carries no per-tool knowledge.
+   */
+  disambiguationHint?: string;
   /** Execute against validated args. Should resolve (ok:false) rather than throw. */
   execute(args: JsonObject, ctx: ToolContext): Promise<ToolResult>;
 }
@@ -1240,6 +1268,10 @@ export interface AgentLoopOptions {
   permissionMode: PermissionMode;
   /** Depth budget for subagents this run may spawn (0 = none). */
   maxSubagentDepth: number;
+  /** Whether the active model advertises native tool-calling. When true but the
+   *  model never emits a native call and stalls, the loop warns once that the
+   *  endpoint may be ignoring the `tools` param. */
+  nativeTools?: boolean;
   /** Fallback model id used after N consecutive 529s. */
   fallbackModel?: string;
   /** Retry/backoff policy for transport errors. */

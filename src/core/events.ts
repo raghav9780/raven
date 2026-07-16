@@ -231,6 +231,21 @@ export function projectMessages(events: AgentEvent[]): Message[] {
   return messages;
 }
 
+/**
+ * True if the most recent tool_result in the log is an error (ok === false) —
+ * i.e. the last ACTION the agent took failed. Used by the loop's
+ * success-hallucination guard: a failed last action + a "done" final message is
+ * a hallucinated success to reject. (The current final turn carries no tool_use,
+ * so the last tool_result is genuinely the preceding action's outcome.)
+ */
+export function lastToolResultErrored(session: Session): boolean {
+  for (let i = session.events.length - 1; i >= 0; i -= 1) {
+    const event = session.events[i];
+    if (event.type === 'tool_result') return event.result.ok === false;
+  }
+  return false;
+}
+
 /** Extract tool_use blocks from a set of content blocks. */
 export function toolUsesOf(content: ContentBlock[]): ToolUseBlock[] {
   return content.filter(
