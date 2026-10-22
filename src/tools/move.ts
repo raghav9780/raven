@@ -11,8 +11,15 @@
 
 import { rename, copyFile, unlink, mkdir, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { dirname, isAbsolute, resolve } from 'node:path';
+import { dirname, resolve, sep } from 'node:path';
 import type { JsonObject, Tool, ToolContext, ToolResult } from '../contracts.ts';
+
+/** True if `ancestor` is the same path as, or a parent of, `child`. */
+function containsPath(ancestor: string, child: string): boolean {
+  if (ancestor === child) return true;
+  const a = ancestor.endsWith(sep) ? ancestor : ancestor + sep;
+  return child.startsWith(a);
+}
 
 export const moveTool: Tool = {
   name: 'move',
@@ -53,8 +60,34 @@ export const moveTool: Tool = {
     if (rawSource.length === 0) return { ok: false, content: 'No source provided.' };
     if (rawDest.length === 0) return { ok: false, content: 'No destination provided.' };
 
-    const source = isAbsolute(rawSource) ? rawSource : resolve(ctx.cwd, rawSource);
-    const dest = isAbsolute(rawDest) ? rawDest : resolve(ctx.cwd, rawDest);
+    // resolve() both normalizes separators AND honors an already-absolute path
+    // (the cwd base is ignored when rawSource/rawDest is absolute) — so the
+    // guards below compare canonical, same-separator paths.
+    const source = resolve(ctx.cwd, rawSource);
+    const dest = resolve(ctx.cwd, rawDest);
+    const cwd = resolve(ctx.cwd);
+
+    // Refuse to relocate the working directory itself or any parent of it —
+    // moving the project root out from under a live session is catastrophic
+    // (it orphans the harness's own state). Move specific files/subfolders.
+    if (containsPath(source, cwd)) {
+      return {
+        ok: false,
+        content:
+          `Refusing to move "${rawSource}": it is the working directory ` +
+          `(or a parent of it). That would relocate the whole project including ` +
+          `the running session. Move specific files or subfolders instead ` +
+          `(e.g. name each file, or a named subfolder).`,
+      };
+    }
+    // Refuse to move something INTO itself (dest inside source) — an infinite-ish
+    // recursive move.
+    if (containsPath(source, dest)) {
+      return {
+        ok: false,
+        content: `Refusing to move "${rawSource}" into itself ("${rawDest}").`,
+      };
+    }
 
     if (!existsSync(source)) {
       return { ok: false, content: `Source does not exist: ${rawSource}` };

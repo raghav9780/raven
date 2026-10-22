@@ -12,11 +12,14 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { MAIN_AGENT } from '../core/events.ts';
 import type {
   AgentEvent,
   HarnessPaths,
+  MetaEvent,
   Session,
   TranscriptEntry,
   Usage,
@@ -90,7 +93,20 @@ export function createTranscriptWriter(
         };
         batch += `${JSON.stringify(entry)}\n`;
       }
-      appendFileSync(transcriptPath, batch, 'utf8');
+      try {
+        appendFileSync(transcriptPath, batch, 'utf8');
+      } catch (err) {
+        // The transcript file/dir can disappear mid-session (e.g. the working
+        // directory was moved). Recreate the directory and retry once rather
+        // than letting a persistence failure crash the whole REPL — losing
+        // history is bad, but crashing the user's session mid-turn is worse.
+        if ((err as { code?: string }).code === 'ENOENT') {
+          mkdirSync(dirname(transcriptPath), { recursive: true });
+          appendFileSync(transcriptPath, batch, 'utf8');
+        } else {
+          throw err;
+        }
+      }
       writtenCount = session.events.length;
     },
     written: () => writtenCount,
@@ -108,12 +124,22 @@ export function replay(
   const createdAt = events.length > 0 ? events[0].timestamp : new Date().toISOString();
   const updatedAt =
     events.length > 0 ? events[events.length - 1].timestamp : createdAt;
+  // The latest `meta` event carrying a name wins (append-only rename).
+  let name: string | undefined;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const e = events[i];
+    if (e.type === 'meta' && e.name) {
+      name = e.name;
+      break;
+    }
+  }
   return {
     id,
     transcriptPath,
     cwd,
     events,
     totalUsage: sumUsage(events),
+    ...(name ? { name } : {}),
     createdAt,
     updatedAt,
   };
@@ -152,4 +178,90 @@ export function listSessions(paths: HarnessPaths): string[] {
     }))
     .sort((a, b) => b.mtime - a.mtime)
     .map((entry) => entry.id);
+}
+
+/** Display metadata for the resume picker. */
+export interface SessionSummary {
+  id: string;
+  /** User-given name, if any. */
+  name?: string;
+  /** First user message (truncated), used as a label when unnamed. */
+  firstMessage: string;
+  /** Number of events (a rough "size"). */
+  eventCount: number;
+  updatedAt: string;
+}
+
+/** First user message text in a transcript's events (for a readable label). */
+function firstUserText(events: AgentEvent[]): string {
+  for (const e of events) {
+    if (e.type === 'user_message') {
+      const text = e.content
+        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+        .map((b) => b.text)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (text.length > 0) return text;
+    }
+  }
+  return '';
+}
+
+/**
+ * Summaries for the most-recent sessions (default 20), newest first. Each
+ * transcript is loaded tolerantly; an unreadable one is skipped rather than
+ * breaking the whole list.
+ */
+export function listSessionSummaries(
+  paths: HarnessPaths,
+  limit = 20,
+): SessionSummary[] {
+  const out: SessionSummary[] = [];
+  for (const id of listSessions(paths).slice(0, limit)) {
+    try {
+      const session = loadSession(transcriptPathFor(paths, id), paths.root);
+      out.push({
+        id,
+        ...(session.name ? { name: session.name } : {}),
+        firstMessage: firstUserText(session.events),
+        eventCount: session.events.length,
+        updatedAt: session.updatedAt,
+      });
+    } catch {
+      // skip a corrupt/unreadable transcript
+    }
+  }
+  return out;
+}
+
+/** Append a `meta` event renaming a session (works whether or not it's loaded). */
+export function renameSession(
+  paths: HarnessPaths,
+  id: string,
+  name: string,
+): void {
+  const path = transcriptPathFor(paths, id);
+  if (!existsSync(path)) throw new Error(`No such session: ${id}`);
+  const raw = readFileSync(path, 'utf8');
+  const seq = raw.split('\n').filter((l) => l.trim().length > 0).length;
+  const event: MetaEvent = {
+    seq,
+    type: 'meta',
+    timestamp: new Date().toISOString(),
+    agentId: MAIN_AGENT,
+    name,
+  };
+  const entry: TranscriptEntry = { v: SCHEMA_VERSION, sessionId: id, event };
+  const line = `${JSON.stringify(entry)}\n`;
+  // The writer always terminates a line with '\n', so a file that doesn't end
+  // in one is torn from a crashed append. Appending our meta line after that
+  // partial line would push the torn line mid-file, where replay treats it as a
+  // hard corruption error. Truncate the torn tail first, then append cleanly.
+  if (raw.length > 0 && !raw.endsWith('\n')) {
+    const keep = raw.slice(0, raw.lastIndexOf('\n') + 1);
+    writeFileSync(path, `${keep}${line}`, 'utf8');
+  } else {
+    appendFileSync(path, line, 'utf8');
+  }
 }

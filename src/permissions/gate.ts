@@ -57,16 +57,41 @@ function parseRule(rule: string): { tool: string; spec?: string } | null {
   return { tool: m[1].toLowerCase(), spec: m[2] };
 }
 
+/**
+ * Named tool groups for "always allow" grants. A grant earned on ONE
+ * file-mutation tool should cover the whole category, so building a project
+ * doesn't re-prompt as the model alternates write → edit → move. Data-driven
+ * (no scenario knowledge); a group rule is written as `Filewrite(<glob>)`.
+ */
+const TOOL_GROUPS: Record<string, readonly string[]> = {
+  filewrite: ['write', 'edit', 'move'],
+};
+
+/** The path a request targets, per tool (move carries `source`, not `path`). */
+function requestPath(request: PermissionRequest): string {
+  const { input } = request;
+  if (typeof input.path === 'string') return input.path;
+  if (typeof input.source === 'string') return input.source; // move
+  return '';
+}
+
 function ruleMatches(rule: string, request: PermissionRequest): boolean {
   const parsed = parseRule(rule);
-  if (!parsed || parsed.tool !== request.toolName.toLowerCase()) return false;
-  if (parsed.spec === undefined) return true; // whole-tool rule
-  if (request.toolName === 'bash') {
+  if (!parsed) return false;
+  const requestTool = request.toolName.toLowerCase();
+  const group = TOOL_GROUPS[parsed.tool];
+  // A group rule (e.g. `Filewrite(...)`) matches any member tool; a plain rule
+  // must name the exact tool.
+  if (group ? !group.includes(requestTool) : parsed.tool !== requestTool) {
+    return false;
+  }
+  if (parsed.spec === undefined) return true; // whole-tool / whole-group rule
+  if (requestTool === 'bash') {
     const command =
       typeof request.input.command === 'string' ? request.input.command : '';
     return matchBashRule(command, parsed.spec);
   }
-  const path = typeof request.input.path === 'string' ? request.input.path : '';
+  const path = requestPath(request);
   if (path.length === 0) return false;
   const normalized = path.split('\\').join('/');
   try {
@@ -86,7 +111,7 @@ export function createGate(state: GateState, deps: GateDeps): PermissionChecker 
     const answer = await deps.prompter(request, reason);
     if (answer.effect === 'allow') {
       if (answer.remember === 'session' || answer.remember === 'project') {
-        const rule = ruleFor(request);
+        const rule = ruleFor(request, state.cwd);
         if (!state.rules.allow.includes(rule)) state.rules.allow.push(rule);
         if (answer.remember === 'project') deps.persistRule?.(rule);
       }
@@ -178,10 +203,26 @@ export function createGate(state: GateState, deps: GateDeps): PermissionChecker 
   };
 }
 
-/** Build a persistable allow-rule from a request ("always allow" choice). */
-function ruleFor(request: PermissionRequest): string {
+/**
+ * Build a persistable allow-rule from a request ("always allow" choice).
+ * - bash → the exact command (`Bash(git status)`), kept narrow.
+ * - a file-mutation tool (write/edit/move) → the whole `Filewrite` group scoped
+ *   to the project dir (`Filewrite(<cwd>/**)`), so approving one file change
+ *   covers subsequent write/edit/move calls INSIDE the project without
+ *   re-prompting — while staying bounded to this project's tree.
+ * - anything else → a plain whole-tool rule.
+ */
+function ruleFor(request: PermissionRequest, cwd: string): string {
   if (request.toolName === 'bash' && typeof request.input.command === 'string') {
     return `Bash(${request.input.command})`;
+  }
+  const groupName = Object.keys(TOOL_GROUPS).find((g) =>
+    TOOL_GROUPS[g].includes(request.toolName.toLowerCase()),
+  );
+  if (groupName) {
+    const scope = `${cwd.split('\\').join('/').replace(/\/+$/, '')}/**`;
+    const label = groupName.charAt(0).toUpperCase() + groupName.slice(1);
+    return `${label}(${scope})`;
   }
   const tool = request.toolName.charAt(0).toUpperCase() + request.toolName.slice(1);
   return tool;

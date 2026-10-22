@@ -69,6 +69,11 @@ export function pick<T>(items: T[], opts: PickOptions<T>): Promise<T | null> {
       } catch {
         // ignore
       }
+      // Pause the stream so we hand back a deterministic state: whoever runs
+      // next (the line editor's next read, via withPicker.resume) re-arms raw
+      // mode + listeners itself. Leaving it flowing let the editor and the
+      // readline keypress decoder contend for stdin (the freeze).
+      stdin.pause();
       stdout.write('\x1b[?25h'); // show cursor
     };
 
