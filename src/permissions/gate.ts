@@ -10,6 +10,7 @@
  * Deny returns a model-facing reason — a denial is a conversation, not a wall.
  */
 
+import { isAbsolute, relative, resolve } from 'node:path';
 import { isProtected } from './paths.ts';
 import { isDangerous, isKnownSafeCommand, matchBashRule } from './bash-match.ts';
 import { globToRegExp } from '../tools/glob.ts';
@@ -67,15 +68,30 @@ const TOOL_GROUPS: Record<string, readonly string[]> = {
   filewrite: ['write', 'edit', 'move'],
 };
 
-/** The path a request targets, per tool (move carries `source`, not `path`). */
-function requestPath(request: PermissionRequest): string {
-  const { input } = request;
-  if (typeof input.path === 'string') return input.path;
-  if (typeof input.source === 'string') return input.source; // move
-  return '';
+/** Input keys that carry a filesystem path, across all tools. */
+const PATH_ARGS = ['path', 'source', 'destination'] as const;
+
+/** Every non-empty path-like argument of a request. */
+function requestPaths(request: PermissionRequest): string[] {
+  return PATH_ARGS.map((key) => request.input[key]).filter(
+    (v): v is string => typeof v === 'string' && v.length > 0,
+  );
 }
 
-function ruleMatches(rule: string, request: PermissionRequest): boolean {
+/** Does one path satisfy a path-rule spec? Absolute specs match the resolved
+ *  absolute path; relative specs match the path relative to cwd. */
+function pathMatchesSpec(path: string, spec: string, cwd: string): boolean {
+  const abs = resolve(cwd, path);
+  const target = isAbsolute(spec) ? abs : relative(cwd, abs);
+  const normalized = target.split('\\').join('/');
+  try {
+    return globToRegExp(spec).test(normalized);
+  } catch {
+    return normalized === spec;
+  }
+}
+
+function ruleMatches(rule: string, request: PermissionRequest, cwd: string): boolean {
   const parsed = parseRule(rule);
   if (!parsed) return false;
   const requestTool = request.toolName.toLowerCase();
@@ -91,14 +107,11 @@ function ruleMatches(rule: string, request: PermissionRequest): boolean {
       typeof request.input.command === 'string' ? request.input.command : '';
     return matchBashRule(command, parsed.spec);
   }
-  const path = requestPath(request);
-  if (path.length === 0) return false;
-  const normalized = path.split('\\').join('/');
-  try {
-    return globToRegExp(parsed.spec).test(normalized);
-  } catch {
-    return normalized === parsed.spec;
-  }
+  // Every path the call touches must be covered — otherwise a move from inside
+  // an allowed tree could send a file anywhere without a prompt.
+  const paths = requestPaths(request);
+  if (paths.length === 0) return false;
+  return paths.every((p) => pathMatchesSpec(p, parsed.spec as string, cwd));
 }
 
 /** Create the permission checker over mutable `state`. */
@@ -124,28 +137,35 @@ export function createGate(state: GateState, deps: GateDeps): PermissionChecker 
     request: PermissionRequest,
   ): Promise<PermissionDecision> {
     const { toolName, input } = request;
-    const path = typeof input.path === 'string' ? input.path : undefined;
     const command = typeof input.command === 'string' ? input.command : undefined;
+    // Every path-like argument the call touches — `path` for most tools,
+    // `source`/`destination` for move — so none can bypass the protected check.
+    const targetPaths = PATH_ARGS.map((key) => input[key]).filter(
+      (v): v is string => typeof v === 'string' && v.length > 0,
+    );
 
     // 1. deny rules (monotonic — a deny beats everything).
     for (const rule of state.rules.deny) {
-      if (ruleMatches(rule, request)) {
+      if (ruleMatches(rule, request, state.cwd)) {
         return decision('deny', 'deny-rule', `Denied by rule: ${rule}`);
       }
     }
 
     // 2. protected path — never read/write .git/.ssh/.env/credentials/config.
-    if (path && isProtected(path, state.protectedPaths, state.cwd)) {
+    const protectedTarget = targetPaths.find((p) =>
+      isProtected(p, state.protectedPaths, state.cwd),
+    );
+    if (protectedTarget) {
       return decision(
         'deny',
         'protected-path',
-        `"${path}" is a protected path and cannot be accessed by tools.`,
+        `"${protectedTarget}" is a protected path and cannot be accessed by tools.`,
       );
     }
 
     // 3. ask rules — explicit confirmation, in every mode incl. bypass.
     for (const rule of state.rules.ask) {
-      if (ruleMatches(rule, request)) {
+      if (ruleMatches(rule, request, state.cwd)) {
         return promptAndResolve(request, `Rule requires confirmation: ${rule}`, 'ask-rule');
       }
     }
@@ -190,14 +210,14 @@ export function createGate(state: GateState, deps: GateDeps): PermissionChecker 
 
     // 8. allow rules.
     for (const rule of state.rules.allow) {
-      if (ruleMatches(rule, request)) return decision('allow', 'allow-rule');
+      if (ruleMatches(rule, request, state.cwd)) return decision('allow', 'allow-rule');
     }
 
     // 9. interactive callback (human, or headless policy default).
     const reason = command
       ? `Run command: ${command}`
-      : path
-        ? `${toolName} → ${path}`
+      : targetPaths.length > 0
+        ? `${toolName} → ${targetPaths.join(' → ')}`
         : `Use tool "${toolName}"`;
     return promptAndResolve(request, reason, 'callback');
   };

@@ -93,7 +93,8 @@ echo "summarize what src/ does" | raven
 
 ## Using a cloud API
 
-Add a provider to `raven.config.json` and mark it `active`:
+Copy `raven.config.example.json` to `raven.config.json` (it's gitignored, so your
+providers and grants stay local), then mark the provider you want as `active`:
 
 ```jsonc
 {

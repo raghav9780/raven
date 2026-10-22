@@ -1,0 +1,28 @@
+{
+  "providers": [
+    {
+      "id": "ollama",
+      "active": true
+    },
+    {
+      "id": "deepseek",
+      "active": false,
+      "type": "openai",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKey": "env:DEEPSEEK_API_KEY",
+      "defaultModel": "deepseek-chat"
+    },
+    {
+      "id": "openai",
+      "active": false,
+      "type": "openai",
+      "apiKey": "env:OPENAI_API_KEY",
+      "defaultModel": "gpt-4o-mini"
+    }
+  ],
+  "permissions": {
+    "allow": [],
+    "deny": [],
+    "ask": []
+  }
+}

@@ -17,3 +17,7 @@ research/
 docs/ARCHITECTURE.md
 harness-builder-prompt.md
 package-lock.json
+
+# Personal per-project config (keys, providers, "always allow" grants).
+# Copy raven.config.example.json to start one.
+raven.config.json
