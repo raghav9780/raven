@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Zero-dependency, local-first, Claude Code-style agent harness",
+  "license": "MIT",
   "engines": {
     "node": ">=22.18"
   },

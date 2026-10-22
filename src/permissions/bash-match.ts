@@ -33,6 +33,17 @@ const DANGER = [
   { re: />\s*\/dev\/(?:sd|nvme|disk|hd)/, reason: 'write to raw device' },
   { re: /\bsudo\b/, reason: 'sudo (privilege escalation)' },
   { re: /\bRemove-Item\b[\s\S]*-Recurse[\s\S]*-Force/i, reason: 'PowerShell recursive force remove' },
+  // Bulk move/copy/delete of EVERYTHING via a bare `*` (not `*.ext`). This is
+  // how a whole project — including the running session — gets relocated or
+  // wiped in one command. `(?<![.\w])\*(?![.\w])` isolates a standalone `*`.
+  {
+    re: /\b(?:mv|cp|move-item|copy-item|move|copy|robocopy)\b[\s\S]*(?<![.\w])\*(?![.\w*])/i,
+    reason: 'bulk move/copy of ALL items in the folder (bare * wildcard)',
+  },
+  {
+    re: /\b(?:rm|del|erase|remove-item|ri|rd)\b[\s\S]*(?<![.\w])\*(?![.\w*])/i,
+    reason: 'bulk delete of ALL items in the folder (bare * wildcard)',
+  },
 ];
 
 /** Split a shell command on control operators, respecting quotes. */

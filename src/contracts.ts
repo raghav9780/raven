@@ -1097,6 +1097,8 @@ export const EventType = {
   Error: 'error',
   /** Session lifecycle marker (start/end/resume). */
   Lifecycle: 'lifecycle',
+  /** Session metadata (e.g. a user-given name); latest-wins on replay. */
+  Meta: 'meta',
 } as const;
 export type EventType = (typeof EventType)[keyof typeof EventType];
 
@@ -1185,6 +1187,14 @@ export interface LifecycleEvent extends EventBase {
   cwd?: string;
 }
 
+/** Session metadata set at runtime (e.g. a user-given name). Append-only: the
+ *  latest `meta` event with a field wins on replay. */
+export interface MetaEvent extends EventBase {
+  type: 'meta';
+  /** Human-friendly session name (for the resume picker). */
+  name?: string;
+}
+
 /** The append-only event union — the harness's durable spine. */
 export type AgentEvent =
   | UserMessageEvent
@@ -1197,7 +1207,8 @@ export type AgentEvent =
   | UsageEvent
   | SubagentEvent
   | ErrorEvent
-  | LifecycleEvent;
+  | LifecycleEvent
+  | MetaEvent;
 
 /** One line of the persisted JSONL transcript (session/jsonl.ts). */
 export interface TranscriptEntry {
@@ -1217,6 +1228,8 @@ export interface Session {
   events: AgentEvent[];
   /** Rolling token/usage totals for the session. */
   totalUsage: Usage;
+  /** Optional user-given name (from the latest `meta` event on replay). */
+  name?: string;
   createdAt: string;
   updatedAt: string;
 }

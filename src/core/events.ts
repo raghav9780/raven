@@ -13,6 +13,7 @@ import type {
   JsonObject,
   LifecycleEvent,
   Message,
+  MetaEvent,
   Session,
   StopReason,
   ToolCallEvent,
@@ -24,7 +25,8 @@ import type {
   Usage,
 } from '../contracts.ts';
 
-const MAIN_AGENT = 'main';
+/** Agent id stamped on events produced by the top-level (non-subagent) loop. */
+export const MAIN_AGENT = 'main';
 
 function stamp(session: Session, type: AgentEvent['type']) {
   return {
@@ -134,6 +136,17 @@ export function recordLifecycle(
   return pushEvent(session, event);
 }
 
+/** Record a session name (append-only; the latest one wins on replay). */
+export function recordMeta(session: Session, name: string): MetaEvent {
+  const event: MetaEvent = {
+    ...stamp(session, 'meta'),
+    type: 'meta',
+    name,
+  };
+  session.name = name;
+  return pushEvent(session, event);
+}
+
 /** Record that context compaction rewrote the projected history. */
 export function recordCompaction(
   session: Session,
@@ -221,7 +234,7 @@ export function projectMessages(events: AgentEvent[]): Message[] {
         pendingToolResults.push(toToolResultBlock(event));
         break;
       default:
-        // usage/permission/compaction/hook/subagent/error/lifecycle,
+        // usage/permission/compaction/hook/subagent/error/lifecycle/meta,
         // and tool_call (the tool_use blocks already live on the assistant
         // message) are not part of the projected conversation.
         break;

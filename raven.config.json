@@ -8,11 +8,34 @@
     },
     {
       "id": "petroit",
-      "active": true,
+      "active": false,
       "type": "openai",
       "baseUrl": "https://ollama.petroit.ai",
       "apiKey": "env:PETROIT_API_KEY",
       "defaultModel": "qwen3:30b"
+    },
+    {
+      "id": "deepseek",
+      "active": true,
+      "type": "openai",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKey": "env:DEEPSEEK_API_KEY",
+      "defaultModel": "deepseek-chat"
+    },
+    {
+      "id": "cerebras",
+      "active": false,
+      "type": "openai",
+      "baseUrl": "https://api.cerebras.ai",
+      "apiKey": "env:CEREBRAS_API_KEY",
+      "defaultModel": "llama-3.3-70b"
     }
-  ]
+  ],
+  "permissions": {
+    "allow": [
+      "Bash(cd 'E:\\auth-system\\frontend' ; npx create-react-app . --quiet)"
+    ],
+    "deny": [],
+    "ask": []
+  }
 }

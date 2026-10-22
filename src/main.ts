@@ -11,7 +11,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createOllamaProvider } from './providers/ollama.ts';
 import { createOpenAIProvider } from './providers/openai.ts';
 import { loadConfig, loadDotEnv, userConfigPath } from './config/load.ts';
@@ -30,6 +30,7 @@ import { grepTool } from './tools/grep.ts';
 import { createGate } from './permissions/gate.ts';
 import { startRepl } from './ui/repl.ts';
 import { pick } from './ui/picker.ts';
+import { toolCallLine, toolResultLine } from './ui/render.ts';
 import {
   createTranscriptWriter,
   listSessions,
@@ -40,7 +41,7 @@ import { runAgentLoop } from './core/loop.ts';
 import { recordLifecycle, recordUserMessage } from './core/events.ts';
 import type { LoopDeps } from './core/loop.ts';
 import type { GateState } from './permissions/gate.ts';
-import type { ReplContext } from './ui/repl.ts';
+import type { ProviderChoice, ReplContext } from './ui/repl.ts';
 import type { LogLevel } from './config/logger.ts';
 import type {
   AgentLoopOptions,
@@ -168,7 +169,7 @@ Options:
   --resume [id]         Resume a saved session (latest if no id given)
   -h, --help            Show this help
 
-Tools: bash, read, write, edit, glob, grep. Sessions save under .raven/sessions.
+Tools: bash, read, write, edit, move, glob, grep, todo_write. Sessions save under .raven/sessions.
 In the REPL: /help lists slash commands; Ctrl+C interrupts a turn, Ctrl+D exits.
 
 Global command: run \`npm link\` once in this repo, then type \`raven\` from any
@@ -186,20 +187,16 @@ function readStdin(): Promise<string> {
   });
 }
 
-/** Wrap a tool so its call + result are echoed to stdout for visibility. */
+/** Wrap a tool so its call + result are echoed to stdout for visibility.
+ *  Routes through the shared render helpers (one-line call summary, capped
+ *  width-clipped result) instead of dumping raw JSON args and file bodies. */
 function withDisplay(tool: Tool): Tool {
   return {
     ...tool,
     async execute(args, ctx): Promise<ToolResult> {
-      const preview = JSON.stringify(args).slice(0, 160);
-      process.stdout.write(`\n\x1b[36m⏺ ${tool.name}(${preview})\x1b[0m\n`);
+      process.stdout.write(`\n${toolCallLine(tool.name, args)}\n`);
       const result = await tool.execute(args, ctx);
-      const body =
-        typeof result.content === 'string'
-          ? result.content
-          : '[structured content]';
-      const status = result.ok ? '\x1b[32m✓\x1b[0m' : '\x1b[31m✗\x1b[0m';
-      process.stdout.write(`  ${status} ${body.slice(0, 500)}\n\n`);
+      process.stdout.write(`${toolResultLine(result)}\n\n`);
       return result;
     },
   };
@@ -244,7 +241,8 @@ function buildSystemPrompt(
       : 'Use POSIX sh syntax and forward-slash paths.';
 
   const base =
-    `You are Raven, an autonomous coding agent running in a terminal in the user's project directory.\n\n` +
+    `You are Raven, an autonomous coding agent running in a terminal in the user's project directory. ` +
+    `You act ONLY on request: when the user asks for an action, do it with tools; when the user greets you or chats, answer in plain text immediately — exploring the project, running commands, or reading files that nobody asked about is WRONG and wastes the user's time and money.\n\n` +
     `Tools (invoke them through the tool-calling mechanism — never write a call as text):\n` +
     `${toolLines}\n\n` +
     `How to work — every turn:\n` +
@@ -252,8 +250,14 @@ function buildSystemPrompt(
     `- To take an action you MUST use the tool-calling mechanism. NEVER print a tool call as text, JSON, or inside a \`\`\` code fence. NEVER print a shell command in a code fence — put the command in the bash tool's "command" argument so it actually runs.\n` +
     `- Do NOT say what you are about to do ("I'll read…", "let me run…"). Do it: emit the tool call now.\n` +
     `- Do NOT ask the user to make trivial choices or supply values you can reasonably pick yourself (file names, sample text, a song's words, etc.). Assume sensible defaults, note them in a few words, and proceed with the tool call. Only ask the user when GENUINELY blocked (missing credentials, or a truly destructive/ambiguous action).\n` +
-    `- Do exactly ONE step per turn: emit a single tool call, then stop and wait for its result.\n` +
+    (nativeTools
+      ? `- Emit the tool calls a step needs. Independent actions (e.g. writing several new files) can go together in one turn; keep dependent steps sequential (do the thing, see its result, then the next).\n`
+      : `- Do exactly ONE step per turn: emit a single tool call, then stop and wait for its result.\n`) +
+    `- Do NOT re-read a file you just wrote or edited to "verify" it — a ✓ result already confirms it. Move on to the next step.\n` +
+    `- A multi-part request is not done until EVERY part is done. Do not stop after the first part or say "no further action needed" while requirements remain — continue to the next part.\n` +
+    `- Do NOT re-announce or restate work already done, and never emit a tool call whose only purpose is to say something is finished. When every part is complete, give ONE short final summary with no tool call and stop.\n` +
     `- Use read/write/edit/glob/grep for files; use bash only for running commands. To rename or move a file use the \`move\` tool — never \`edit\` or \`write\`.\n` +
+    `- For a bulk move/rename/delete, act on an explicit list of named files or a named subfolder. NEVER pass \`.\`, \`*\`, or a parent directory as the source, and NEVER relocate or delete the project directory itself.\n` +
     `- A tool result marked ✗ is a FAILURE. Never state or imply the action succeeded. Either retry with corrected arguments or a more suitable tool, or report plainly what failed — do NOT claim a file was created/renamed/edited unless the tool returned ✓.\n` +
     `- Each turn either CALL a tool OR give your final answer — never neither. When finished, reply with a 1-2 sentence plain-text summary and NO tool call.\n\n` +
     `The bash tool runs ${shellName}. ${shellHint}`;
@@ -371,13 +375,9 @@ async function main(): Promise<void> {
   // to avoid the large-KV-cache latency cliff; override with --num-ctx.
   const requestedCtx = args.numCtx ?? Math.min(profile.contextWindow, DEFAULT_NUM_CTX);
 
-  // Banner
+  // Banner — one compact line; full details live behind /config and /model.
   process.stdout.write(
-    `\n\x1b[1mRaven\x1b[0m  model=\x1b[35m${modelId}\x1b[0m ` +
-      `provider=${model.provider} mode=${config.permissionMode} ` +
-      `ctx=${requestedCtx}/${profile.contextWindow} tools=${profile.nativeTools ? 'native' : profile.toolCallFormat}\n` +
-      `cwd=${config.paths.root}\n` +
-      `discovered ${discovered.length} model(s): ${discovered.join(', ')}\n\n`,
+    `\n\x1b[1mRaven\x1b[0m  \x1b[35m${modelId}\x1b[0m \x1b[2m(${model.provider})\x1b[0m\n\n`,
   );
 
   const logger = createLogger((config.logLevel as LogLevel) ?? 'info');
@@ -415,7 +415,10 @@ async function main(): Promise<void> {
   };
   const persistRule = (rule: string): void => {
     try {
-      const path = userConfigPath();
+      // "Always allow for this PROJECT" → persist to the project's own visible
+      // config (cwd/raven.config.json), NOT the global user config, so a
+      // project-scoped grant stays with that project.
+      const path = join(config.paths.root, 'raven.config.json');
       const existing = existsSync(path)
         ? (JSON.parse(readFileSync(path, 'utf8')) as {
             permissions?: { allow: string[]; deny: string[]; ask: string[] };
@@ -504,6 +507,15 @@ async function main(): Promise<void> {
 
   // ── Interactive REPL (no prompt + a TTY) ──────────────────────────────────
   if (interactive) {
+    // Every built provider, for the `/provider` picker — each paired with its
+    // configured defaultModel (providers keep separate defaults).
+    const providerChoices: ProviderChoice[] = Object.values(providers).map(
+      (p) => ({
+        id: p.id,
+        provider: p,
+        defaultModel: partial.providers?.find((c) => c.id === p.id)?.defaultModel,
+      }),
+    );
     const replCtx: ReplContext = {
       session,
       writer,
@@ -519,6 +531,7 @@ async function main(): Promise<void> {
       numCtxCap: DEFAULT_NUM_CTX,
       runtime: { model: modelId, profile, requestedCtx },
       discovered,
+      providers: providerChoices,
     };
     await startRepl(replCtx);
     return;
@@ -564,9 +577,11 @@ async function main(): Promise<void> {
   };
   const result = await runAgentLoop(session, loopOptions, deps);
   writer.persist(session);
+  // Token counts only when the provider reported them (0→0 = no usage → omit).
+  const { inputTokens: i, outputTokens: o } = result.usage;
+  const tok = i > 0 || o > 0 ? ` · ${i}→${o} tokens` : '';
   process.stdout.write(
-    `\n\n\x1b[2m── done (${result.stopReason}) · ${result.turns} turn(s) · ` +
-      `${result.usage.inputTokens}→${result.usage.outputTokens} tokens ──\x1b[0m\n` +
+    `\n\n\x1b[2m── done (${result.stopReason}) · ${result.turns} turn(s)${tok} ──\x1b[0m\n` +
       `\x1b[2msession ${session.id} · resume with: --resume ${session.id}\x1b[0m\n`,
   );
 }

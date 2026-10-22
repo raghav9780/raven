@@ -213,6 +213,22 @@ export async function runAgentLoop(
   let lastFingerprint = '';
   let repeatCount = 0;
   let nudges = 0;
+  // Consecutive turns that made a tool call but no REAL progress (no successful
+  // mutation / new observation) — catches the "keeps emitting a throwaway call
+  // plus a 'done' claim" flood that the byte-identical repeat guard misses.
+  const MAX_NO_PROGRESS = 3;
+  let noProgressTurns = 0;
+  // Last prose emitted to the user, normalized — so back-to-back identical or
+  // near-identical "already done / no further action" messages print once.
+  let lastEmitted = '';
+  const emitText = (text: string): void => {
+    const trimmed = text.trim();
+    if (trimmed.length === 0) return;
+    const norm = trimmed.replace(/\s+/g, ' ').toLowerCase();
+    if (norm === lastEmitted) return; // consecutive duplicate → skip
+    lastEmitted = norm;
+    deps.onAssistantText?.(text);
+  };
   // Run-scoped working plan (the todo_write tool sets it via ctx.setTodos); the
   // loop re-injects it as an ephemeral <system-reminder> each turn.
   const todos: { items: TodoItem[] } = { items: [] };
@@ -362,6 +378,16 @@ export async function runAgentLoop(
     finalText = textOf(turn.content);
 
     if (turn.toolUses.length === 0) {
+      // Are we actually mid-task? An objective, non-lexical signal: the model
+      // has already made a tool call this run, OR it set itself a working plan
+      // with unfinished steps. Only then is a no-tool "I'll do it" / "which
+      // file?" reply a genuine STALL worth nudging. On a fresh turn with neither
+      // (a greeting, a plain question, chit-chat) there is nothing to complete —
+      // we trust the model's reply and let IT decide whether action is needed,
+      // rather than our code guessing from the wording of the message.
+      const midTask =
+        sawNativeToolCall ||
+        todos.items.some((t) => t.status !== 'completed');
       // Error gate: a failed last action + a "done"-style final message is a
       // hallucinated success. Reject it once — tell the model the truth and let
       // it retry or report honestly — instead of printing the false claim.
@@ -389,6 +415,7 @@ export async function runAgentLoop(
       // it to choose defaults and act, then continue (bounded by MAX_NUDGES).
       if (
         nudges < MAX_NUDGES &&
+        midTask &&
         (looksLikeNarration(finalText) || looksLikeDeferral(finalText))
       ) {
         nudges += 1;
@@ -410,17 +437,22 @@ export async function runAgentLoop(
       }
       // Accepted as the final answer — emit the reconciled prose ONCE (recovery
       // has already stripped any text-encoded tool call; nothing streamed raw).
-      if (finalText.trim().length > 0) deps.onAssistantText?.(finalText);
-      // If this "final" turn is really a stall (narration/deferral) and the model
-      // never made a native call, it likely can't tool-call — surface it once.
-      if (looksLikeNarration(finalText) || looksLikeDeferral(finalText)) {
+      emitText(finalText);
+      // If this "final" turn is really a stall (narration/deferral) mid-task and
+      // the model never made a native call, it likely can't tool-call — surface
+      // it once. On a fresh conversational turn (no mid-task signal) a friendly
+      // reply isn't a stall, so we stay quiet.
+      if (
+        midTask &&
+        (looksLikeNarration(finalText) || looksLikeDeferral(finalText))
+      ) {
         warnToolsIgnoredOnStall();
       }
       stopReason = 'no_tool_use';
       break;
     }
     // Tool-use turn: show any leftover prose that accompanied the call(s).
-    if (finalText.trim().length > 0) deps.onAssistantText?.(finalText);
+    emitText(finalText);
     nudges = 0; // a tool call is progress
 
     // Stuck-loop guard: the same tool call(s) repeated with no progress.
@@ -469,6 +501,7 @@ export async function runAgentLoop(
     // synthesize an error result for every not-yet-executed tool_use so the
     // event log never holds an orphaned tool_use (invalid on resume/replay).
     let aborted = false;
+    const startEvents = session.events.length;
     for (let i = 0; i < turn.toolUses.length; i += 1) {
       if (opts.signal?.aborted) {
         for (let j = i; j < turn.toolUses.length; j += 1) {
@@ -488,6 +521,35 @@ export async function runAgentLoop(
       deps.persist?.(session);
       stopReason = 'aborted';
       break;
+    }
+
+    // No-progress guard: a turn "progressed" if a non-todo tool succeeded this
+    // turn. A run of tool turns that accomplish nothing real (failed edits,
+    // todo_write-only churn) while the model keeps claiming completion is the
+    // flood the byte-identical repeat guard can't see — cap it.
+    const realIds = new Set(
+      turn.toolUses.filter((t) => t.name !== 'todo_write').map((t) => t.id),
+    );
+    const progressed = session.events
+      .slice(startEvents)
+      .some(
+        (e) =>
+          e.type === 'tool_result' && e.result.ok === true && realIds.has(e.toolUseId),
+      );
+    if (progressed) {
+      noProgressTurns = 0;
+    } else {
+      noProgressTurns += 1;
+      if (noProgressTurns >= MAX_NO_PROGRESS) {
+        recordError(
+          session,
+          'loop',
+          'multiple tool turns with no real progress — stopping',
+        );
+        deps.persist?.(session);
+        stopReason = 'loop';
+        break;
+      }
     }
     if (turns >= opts.maxTurns) {
       stopReason = 'max_turns';
